@@ -34,3 +34,5 @@ out*.txt
 resp-*.json
 *-body.json
 models.json
+demo/.local/
+target/demo/
