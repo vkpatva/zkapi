@@ -74,6 +74,8 @@ fn unavailable(message: &str) -> RpcReadFailure {
 #[derive(Clone)]
 pub struct NativeBillingConfig {
     pub rpc_url: String,
+    /// The pinned ETH/USD feed; empty when the server only serves fixed-price
+    /// direct requests, which need no price (quotes are then refused).
     pub feed_address: String,
     pub decimals: u8,
     pub max_age_seconds: u64,
@@ -364,7 +366,8 @@ impl NativeBillingOracle {
             "native oracle RPC cannot contain credentials or a fragment"
         );
         anyhow::ensure!(
-            valid_address(&config.feed_address) && valid_address(&contract_address),
+            (config.feed_address.is_empty() || valid_address(&config.feed_address))
+                && valid_address(&contract_address),
             "native oracle and vault require nonzero Ethereum addresses"
         );
         anyhow::ensure!(
@@ -891,6 +894,11 @@ impl NativeBillingOracle {
     }
 
     async fn assert_deployment(&self) -> Result<(), ServerError> {
+        if self.config.feed_address.is_empty() {
+            return Err(invalid(
+                "no price feed is configured: this server charges fixed direct prices only",
+            ));
+        }
         self.assert_chain().await?;
         let decimals = decode_word(
             &self.call(&self.config.feed_address, "0x313ce567").await?,

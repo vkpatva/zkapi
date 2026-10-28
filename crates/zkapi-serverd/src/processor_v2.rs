@@ -422,6 +422,18 @@ enum FallbackCause {
     Unsettleable(String),
 }
 
+/// What `admit_request` found before verifying a request's proof.
+enum Admission {
+    /// Not reserved before: verify the proof and reserve it.
+    Fresh,
+    /// The same request was reserved before by this endpoint: its signed
+    /// response, or None while it is still unsigned.
+    Existing(Option<Box<RequestResponseV2>>),
+}
+
+/// Largest upstream response body a direct request returns.
+const DIRECT_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+
 /// The integrity of a lease row against its nullifier reservation.
 enum LeaseBinding {
     Valid(Box<TranscriptRecord>),
@@ -456,6 +468,8 @@ pub struct RequestProcessor {
     openrouter: Option<Arc<OpenRouterProvisioner>>,
     oa_org: Option<Arc<OaOrgProvisioner>>,
     native_oracle: NativeBillingOracle,
+    /// The client of the operator's own API, when direct requests are served.
+    direct_http: Option<reqwest::Client>,
     lease_issue_lock: tokio::sync::Mutex<()>,
     lease_locks: LeaseLocks,
     /// Unix time before which no OA usage read is started, because the org
@@ -554,6 +568,16 @@ impl RequestProcessor {
                 OpenRouterLeaseSourceConfig::OpenRouter { .. } => None,
             })
             .transpose()?;
+        let direct_http = config
+            .direct_api
+            .as_ref()
+            .map(|direct| {
+                reqwest::Client::builder()
+                    .timeout(Duration::from_millis(direct.timeout_ms))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+            })
+            .transpose()?;
         let indexer_root = if config.indexer_url.is_some() {
             IndexerRootStatus::Unchecked
         } else {
@@ -561,6 +585,7 @@ impl RequestProcessor {
         };
         Ok(Self {
             native_oracle,
+            direct_http,
             config,
             store,
             signer,
@@ -3130,6 +3155,55 @@ impl RequestProcessor {
         issuance: Option<&IssuanceLease<'_>>,
         verify: impl FnOnce() -> Result<bool, ServerError>,
     ) -> Result<Option<RequestResponseV2>, ServerError> {
+        if let Admission::Existing(response) = self.admit_request(request, "openrouter_lease")? {
+            return Ok(response.map(|response| *response));
+        }
+        if !verify()? {
+            return Err(ServerError::InvalidProof(
+                "Groth16 verification returned false".to_string(),
+            ));
+        }
+
+        // Proof verification is synchronous but can be slow. Recheck at the
+        // actual reservation boundary, while issue_openrouter_lease retains
+        // its serialization lock. A matching existing reservation returned
+        // above and keeps its original quote even after expiration.
+        let quote = self.lease_authorization(request)?.1;
+        let lease = issuance
+            .map(|issuance| self.issuance_lease_row(request, issuance, current_timestamp()));
+        self.reserve_at_admissible_root(request, |now| {
+            self.native_oracle.assert_fresh(&quote, now)?;
+            self.store
+                .reserve_openrouter_lease_with(request, lease.as_ref())
+        })?;
+        Ok(None)
+    }
+
+    /// Run `reserve` while `request`'s root is still admissible. A retirement
+    /// can land while Groth16 verification runs: recheck and hold the same
+    /// lock the root poller uses through the synchronous DB transaction, so
+    /// invalidated roots cannot become resumable reservations.
+    fn reserve_at_admissible_root(
+        &self,
+        request: &ApiRequestV2,
+        reserve: impl FnOnce(u64) -> Result<(), ServerError>,
+    ) -> Result<(), ServerError> {
+        let roots = self
+            .vault_roots
+            .lock()
+            .map_err(|_| ServerError::Internal("root state lock poisoned".into()))?;
+        let now = current_timestamp();
+        self.admissible_root_locked(&roots, &request.public_inputs.active_root, now)?;
+        reserve(now)
+    }
+
+    /// The checks of a request before its proof is verified: payload hash,
+    /// deployment, root, signing key, freshness, solvency bound and
+    /// authorization tag. A byte-identical request already reserved by an
+    /// endpoint of `kind` returns its outcome (`Admission::Existing`) before
+    /// the root and freshness checks, so a transport retry stays possible
+    /// after those values move. A different kind can never claim it.
+    fn admit_request(&self, request: &ApiRequestV2, kind: &str) -> Result<Admission, ServerError> {
         let public = &request.public_inputs;
         let payload_hash = canonical_payload_hash(request.payload.as_bytes());
         if payload_hash != request.payload_hash {
@@ -3157,16 +3231,16 @@ impl RequestProcessor {
             let same_request = existing.client_request_id.as_deref()
                 == Some(&request.client_request_id)
                 && existing.payload_hash == Some(request.payload_hash)
-                && existing.reservation_kind == "openrouter_lease"
+                && existing.reservation_kind == kind
                 && existing.api_request_binding.as_deref() == Some(request_binding.as_str());
             if !same_request {
                 return Err(ServerError::Replay);
             }
             return match existing.status {
-                NullifierStatus::Finalized => {
-                    response_from_record(&existing, &request.client_request_id).map(Some)
-                }
-                NullifierStatus::Reserved => Ok(None),
+                NullifierStatus::Finalized => Ok(Admission::Existing(Some(Box::new(
+                    response_from_record(&existing, &request.client_request_id)?,
+                )))),
+                NullifierStatus::Reserved => Ok(Admission::Existing(None)),
                 NullifierStatus::ClearanceReserved => Err(ServerError::Replay),
                 NullifierStatus::ExitedUnsigned => Err(ServerError::NullifierUsed),
             };
@@ -3202,32 +3276,7 @@ impl RequestProcessor {
                 "proof authorization tag does not bind this request id and payload".to_string(),
             ));
         }
-        if !verify()? {
-            return Err(ServerError::InvalidProof(
-                "Groth16 verification returned false".to_string(),
-            ));
-        }
-
-        // Proof verification is synchronous but can be slow. Recheck at the
-        // actual reservation boundary, while issue_openrouter_lease retains
-        // its serialization lock. A matching existing reservation returned
-        // above and keeps its original quote even after expiration.
-        let quote = self.lease_authorization(request)?.1;
-        let lease = issuance
-            .map(|issuance| self.issuance_lease_row(request, issuance, current_timestamp()));
-        // A retirement can land while Groth16 verification runs. Recheck and
-        // hold the same lock the root poller uses through the synchronous DB
-        // transaction: invalidated roots cannot become resumable reservations.
-        let roots = self
-            .vault_roots
-            .lock()
-            .map_err(|_| ServerError::Internal("root state lock poisoned".into()))?;
-        let now = current_timestamp();
-        self.admissible_root_locked(&roots, &public.active_root, now)?;
-        self.native_oracle.assert_fresh(&quote, now)?;
-        self.store
-            .reserve_openrouter_lease_with(request, lease.as_ref())?;
-        Ok(None)
+        Ok(Admission::Fresh)
     }
 
     /// Settle a lease (§5.1 step 1): fix its charge and persist it on the
@@ -3452,9 +3501,12 @@ impl RequestProcessor {
             .store
             .try_lookup_by_nullifier(&nullifier)?
             .ok_or_else(|| ServerError::Internal("the request has no reservation".into()))?;
-        if record.reservation_kind != "openrouter_lease" {
+        if !matches!(
+            record.reservation_kind.as_str(),
+            "openrouter_lease" | "direct"
+        ) {
             return Err(ServerError::InvalidRequest(
-                "only native lease reservations can settle".into(),
+                "only native lease and direct reservations can settle".into(),
             ));
         }
         if record.client_request_id.as_deref() != Some(request.client_request_id.as_str())
@@ -3602,6 +3654,24 @@ impl RequestProcessor {
             let Some(_guard) = self.lease_locks.try_lock(id) else {
                 continue;
             };
+            if record.reservation_kind == "direct" {
+                match self.store.try_lookup_direct_request(id) {
+                    Ok(Some(request))
+                        if request.public_inputs.request_nullifier == record.nullifier =>
+                    {
+                        if let Err(error) = self.sign_successor(&request).await {
+                            tracing::warn!(client_request_id = %id, error = %error, "successor signing will be retried");
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::error!(client_request_id = %id, "a settled direct request has no matching saved request; its successor cannot be signed")
+                    }
+                    Err(error) => {
+                        tracing::error!(client_request_id = %id, error = %error, "a settled direct request cannot be read")
+                    }
+                }
+                continue;
+            }
             let lease = match self.store.try_lookup_openrouter_lease(id) {
                 Ok(Some(lease)) if lease.request_nullifier == record.nullifier => lease,
                 Ok(_) => {
@@ -3621,6 +3691,77 @@ impl RequestProcessor {
 
     pub fn openrouter_leases_enabled(&self) -> bool {
         self.config.openrouter_leases.is_some()
+    }
+
+    pub fn direct_api_enabled(&self) -> bool {
+        self.config.direct_api.is_some()
+    }
+
+    /// Serve a direct request (`POST /v2/requests`): admit it, verify its
+    /// proof, call the operator's own API with its payload, and only then
+    /// reserve its nullifier settled at the fixed price, with its evidence, in
+    /// one transaction; finally sign its successor. A failed upstream call
+    /// reserves and charges nothing, so the same request can be retried. A
+    /// byte-identical retry of a reserved request returns its signed response
+    /// (signing it first if it is still unsigned) without calling upstream.
+    pub async fn process_direct_request(
+        &self,
+        request: &ApiRequestV2,
+    ) -> Result<RequestResponseV2, ServerError> {
+        let (Some(direct), Some(http)) =
+            (self.config.direct_api.as_ref(), self.direct_http.as_ref())
+        else {
+            return Err(ServerError::InvalidRequest(
+                "this server does not serve direct requests".into(),
+            ));
+        };
+        check_signable(request)?;
+        match self.admit_request(request, "direct")? {
+            Admission::Existing(Some(response)) => return Ok(*response),
+            Admission::Existing(None) => return self.direct_response(request).await,
+            Admission::Fresh => {}
+        }
+        if !self
+            .verifier
+            .verify(&request.public_inputs, &request.proof)
+            .map_err(|error| ServerError::InvalidProof(error.to_string()))?
+        {
+            return Err(ServerError::InvalidProof(
+                "Groth16 verification returned false".to_string(),
+            ));
+        }
+        let (response_code, response_payload) = call_direct_upstream(http, direct, request).await?;
+        let settled = SettledCharge {
+            charge: direct.price_units,
+            basis: "measured".into(),
+            response_code,
+            response_payload,
+            settled_at: current_timestamp(),
+        };
+        self.reserve_at_admissible_root(request, |_| {
+            self.store.reserve_direct_request(request, &settled)
+        })?;
+        if let Some(hub) = &self.dashboard {
+            self.record_dashboard_settlement(hub, request, &settled, "direct", None);
+        }
+        self.direct_response(request).await
+    }
+
+    /// The signed response of a reserved direct request, signing it now if
+    /// its nullifier is unspent on chain.
+    async fn direct_response(
+        &self,
+        request: &ApiRequestV2,
+    ) -> Result<RequestResponseV2, ServerError> {
+        let _guard = self.lease_locks.lock(&request.client_request_id).await;
+        match self.sign_successor(request).await? {
+            SignOutcome::Signed(response) => Ok(*response),
+            // The state this request spent is being exited on chain: no
+            // successor is signed unless that exit is defeated.
+            SignOutcome::Deferred { .. } | SignOutcome::ExitedUnsigned => {
+                Err(ServerError::NullifierUsed)
+            }
+        }
     }
 
     /// The deadline a pending lease will be finalized by, without assigning
@@ -4133,6 +4274,43 @@ impl RequestProcessor {
     pub fn store(&self) -> &Arc<NullifierStore> {
         &self.store
     }
+}
+
+/// POST the request's payload to the operator's API. Only a 2xx response
+/// with a UTF-8 body of at most `DIRECT_RESPONSE_MAX_BYTES` is served.
+async fn call_direct_upstream(
+    http: &reqwest::Client,
+    direct: &crate::config::DirectApiConfig,
+    request: &ApiRequestV2,
+) -> Result<(u16, String), ServerError> {
+    let failed = |message: String| ServerError::UpstreamFailed(message);
+    let response = http
+        .post(&direct.upstream_url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request.payload.clone())
+        .send()
+        .await
+        .map_err(|error| failed(error.without_url().to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(failed(format!("status {status}")));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > DIRECT_RESPONSE_MAX_BYTES as u64)
+    {
+        return Err(failed("response body is too large".into()));
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| failed(error.without_url().to_string()))?;
+    if body.len() > DIRECT_RESPONSE_MAX_BYTES {
+        return Err(failed("response body is too large".into()));
+    }
+    let body = String::from_utf8(body.to_vec())
+        .map_err(|_| failed("response body is not UTF-8".into()))?;
+    Ok((status.as_u16(), body))
 }
 
 fn response_from_record(
@@ -12675,5 +12853,242 @@ mod tests {
             (status, body),
             (StatusCode::NOT_FOUND, serde_json::Value::Null)
         );
+    }
+}
+
+#[cfg(test)]
+mod direct_tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    use axum::{routing::post, Json, Router};
+    use serde_json::{json, Value};
+
+    use crate::config::DirectApiConfig;
+
+    const PRICE: u128 = 250;
+    const CAP: u128 = 1_000;
+
+    fn seeds() -> (Felt252, Felt252) {
+        (Felt252::from_u64(21), Felt252::from_u64(22))
+    }
+
+    /// A search API on loopback that answers `{"query", "results"}` and
+    /// counts its calls; it fails with 503 while `failing` is set.
+    async fn upstream(failing: Arc<AtomicBool>, calls: Arc<AtomicUsize>) -> String {
+        let app = Router::new().route(
+            "/search",
+            post(move |Json(body): Json<Value>| {
+                let failing = failing.clone();
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if failing.load(Ordering::SeqCst) {
+                        return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                    }
+                    Ok(Json(json!({
+                        "query": body["query"],
+                        "results": [{"title": "Zero-knowledge proofs", "score": 1}],
+                    })))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}/search")
+    }
+
+    /// A direct-only processor: no lease source and no price feed.
+    fn direct_processor(upstream_url: String) -> RequestProcessor {
+        let mut native = crate::test_support::native_config();
+        native.feed_address = String::new();
+        RequestProcessor::try_new(
+            ServerConfig {
+                request_charge_cap: CAP,
+                contract_address: Felt252::from_u64(1),
+                native_billing: Some(native),
+                proof_setup_dir: crate::test_support::setup_directory(),
+                direct_api: Some(DirectApiConfig {
+                    upstream_url,
+                    price_units: PRICE,
+                    timeout_ms: 5_000,
+                }),
+                ..Default::default()
+            },
+            Arc::new(NullifierStore::in_memory().unwrap()),
+            Arc::new(ServerSigner::new(&seeds().0, &seeds().1)),
+            Felt252::ZERO,
+        )
+        .unwrap()
+    }
+
+    fn search(
+        processor: &RequestProcessor,
+        note: &crate::test_support::TestNote,
+        id: &str,
+        query: &str,
+    ) -> crate::test_support::PreparedTestRequest {
+        let now = current_timestamp();
+        let prepared = note.prepare_request(
+            id,
+            json!({"query": query, "limit": 3}).to_string(),
+            now,
+            CAP,
+        );
+        processor.update_root(prepared.request.public_inputs.active_root);
+        prepared
+    }
+
+    #[tokio::test]
+    async fn direct_requests_charge_the_fixed_price_and_chain_signed_successors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let url = upstream(Arc::default(), calls.clone()).await;
+        let processor = direct_processor(url);
+        let mut note = crate::test_support::processor_note(&processor, seeds(), 10_000);
+        for (step, query) in ["zk proofs", "nullifiers"].iter().enumerate() {
+            let prepared = search(&processor, &note, &format!("search-{step}"), query);
+            let response = processor
+                .process_direct_request(&prepared.request)
+                .await
+                .unwrap();
+            assert_eq!(response.charge_applied, PRICE);
+            let body: Value = serde_json::from_str(&response.response_payload).unwrap();
+            assert_eq!(body["query"], *query);
+            // The client's S1–S6 checks pass and the note moves on.
+            note.complete(&prepared, &response).unwrap();
+            let record = processor
+                .store
+                .try_lookup_by_nullifier(&prepared.request.public_inputs.request_nullifier)
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.reservation_kind, "direct");
+            assert_eq!(record.status, NullifierStatus::Finalized);
+            assert_eq!(
+                processor
+                    .store
+                    .request_evidence(&prepared.request.public_inputs.request_nullifier)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(note.state.balance, 10_000 - 2 * PRICE);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_retried_direct_request_returns_its_response_without_calling_upstream() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let url = upstream(Arc::default(), calls.clone()).await;
+        let processor = direct_processor(url);
+        let note = crate::test_support::processor_note(&processor, seeds(), 10_000);
+        let prepared = search(&processor, &note, "retry", "zk proofs");
+        let first = processor
+            .process_direct_request(&prepared.request)
+            .await
+            .unwrap();
+        let again = processor
+            .process_direct_request(&prepared.request)
+            .await
+            .unwrap();
+        assert_eq!(first.next_commitment, again.next_commitment);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The same proof under another request ID is a replay.
+        let mut other = prepared.request.clone();
+        other.client_request_id = "other".into();
+        assert!(processor.process_direct_request(&other).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failed_upstream_call_charges_nothing_and_can_be_retried() {
+        let failing = Arc::new(AtomicBool::new(true));
+        let url = upstream(failing.clone(), Arc::default()).await;
+        let processor = direct_processor(url);
+        let mut note = crate::test_support::processor_note(&processor, seeds(), 10_000);
+        let prepared = search(&processor, &note, "flaky", "zk proofs");
+        let nullifier = prepared.request.public_inputs.request_nullifier;
+        assert!(matches!(
+            processor.process_direct_request(&prepared.request).await,
+            Err(ServerError::UpstreamFailed(_))
+        ));
+        assert!(processor
+            .store
+            .try_lookup_by_nullifier(&nullifier)
+            .unwrap()
+            .is_none());
+        failing.store(false, Ordering::SeqCst);
+        let response = processor
+            .process_direct_request(&prepared.request)
+            .await
+            .unwrap();
+        note.complete(&prepared, &response).unwrap();
+        assert_eq!(note.state.balance, 10_000 - PRICE);
+    }
+
+    #[tokio::test]
+    async fn the_signing_pass_signs_a_direct_request_the_request_path_could_not() {
+        let url = upstream(Arc::default(), Arc::default()).await;
+        let processor = direct_processor(url);
+        let note = crate::test_support::processor_note(&processor, seeds(), 10_000);
+        let prepared = search(&processor, &note, "unsigned", "zk proofs");
+        processor.test_chain().unavailable = true;
+        assert!(processor
+            .process_direct_request(&prepared.request)
+            .await
+            .is_err());
+        // Reserved and settled at the price, but unsigned.
+        let nullifier = prepared.request.public_inputs.request_nullifier;
+        let record = processor
+            .store
+            .try_lookup_by_nullifier(&nullifier)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.settled_charge, Some(PRICE));
+        assert_eq!(record.status, NullifierStatus::Reserved);
+        processor.test_chain().unavailable = false;
+        processor.sign_settled_successors().await;
+        let record = processor
+            .store
+            .try_lookup_by_nullifier(&nullifier)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        assert_eq!(record.charge_applied, Some(PRICE));
+    }
+
+    #[test]
+    fn direct_configuration_rules() {
+        let mut native = crate::test_support::native_config();
+        native.feed_address = String::new();
+        let direct = DirectApiConfig {
+            upstream_url: "http://127.0.0.1:8080/search".into(),
+            price_units: PRICE,
+            timeout_ms: 1_000,
+        };
+        let config = ServerConfig {
+            request_charge_cap: CAP,
+            native_billing: Some(native),
+            direct_api: Some(direct.clone()),
+            ..Default::default()
+        };
+        // Neither a lease source nor a price feed is needed.
+        config.validate_native_mode().unwrap();
+        // The price must fit every admitted request's solvency bound.
+        let mut over = config.clone();
+        over.direct_api = Some(DirectApiConfig {
+            price_units: CAP + 1,
+            ..direct.clone()
+        });
+        assert!(over.validate_native_mode().is_err());
+        // Leases still need the price feed.
+        let mut leases = config.clone();
+        leases.openrouter_leases = Some(crate::test_support::lease_config());
+        assert!(leases.validate_native_mode().is_err());
+        // And a server serves something.
+        let mut nothing = config;
+        nothing.direct_api = None;
+        assert!(nothing.validate_native_mode().is_err());
     }
 }

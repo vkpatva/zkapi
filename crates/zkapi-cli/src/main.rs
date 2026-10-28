@@ -176,13 +176,36 @@ enum Commands {
             hide_env_values = true
         )]
         native_billing_rpc_url: Option<String>,
+        /// The pinned ETH/USD feed of lease billing. Not needed when the
+        /// server serves only fixed-price direct requests (--direct-api-url).
         #[arg(
             long,
             env = "ZKAPI_NATIVE_PRICE_FEED_ADDRESS",
-            required = true,
+            required_unless_present = "direct_api_url",
             hide_env_values = true
         )]
         native_price_feed_address: Option<String>,
+        /// Serve fixed-price direct requests (POST /v2/requests) from this
+        /// operator API: each admitted request's payload is POSTed to it and
+        /// its 2xx body returned. With it, no lease source is required.
+        #[arg(long, env = "ZKAPI_DIRECT_API_URL", hide_env_values = true)]
+        direct_api_url: Option<String>,
+        /// The charge of every direct request, in whole gwei; at most
+        /// --request-charge-cap.
+        #[arg(
+            long,
+            env = "ZKAPI_DIRECT_API_PRICE_UNITS",
+            requires = "direct_api_url",
+            hide_env_values = true
+        )]
+        direct_api_price_units: Option<u128>,
+        #[arg(
+            long,
+            env = "ZKAPI_DIRECT_API_TIMEOUT_MS",
+            default_value_t = zkapi_serverd::config::DEFAULT_DIRECT_API_TIMEOUT_MS,
+            hide_env_values = true
+        )]
+        direct_api_timeout_ms: u64,
         /// Must equal the published manifest's native price feed decimals.
         #[arg(
             long,
@@ -425,6 +448,9 @@ async fn main() -> anyhow::Result<()> {
             allow_key_source_switch,
             native_billing_rpc_url,
             native_price_feed_address,
+            direct_api_url,
+            direct_api_price_units,
+            direct_api_timeout_ms,
             native_price_feed_decimals,
             native_price_max_age_seconds,
             db_path,
@@ -471,8 +497,10 @@ async fn main() -> anyhow::Result<()> {
                 (None, None, Some(_)) => {
                     anyhow::bail!("an OA org shared secret requires --oa-org-url")
                 }
+                (None, None, None) if direct_api_url.is_some() => None,
                 (None, None, None) => anyhow::bail!(
-                    "configure an OA org or OpenRouter management credential for native leases"
+                    "configure an OA org or OpenRouter management credential for native leases, \
+                     or --direct-api-url for direct requests"
                 ),
             };
             let openrouter_leases = lease_source.map(|source| OpenRouterLeaseConfig {
@@ -491,7 +519,29 @@ async fn main() -> anyhow::Result<()> {
                         max_age_seconds: native_price_max_age_seconds,
                     })
                 }
+                // Direct requests only: fixed prices need no price feed.
+                (Some(rpc_url), None) if openrouter_leases.is_none() => {
+                    Some(zkapi_serverd::native_billing::NativeBillingConfig {
+                        rpc_url,
+                        feed_address: String::new(),
+                        decimals: native_price_feed_decimals,
+                        max_age_seconds: native_price_max_age_seconds,
+                    })
+                }
                 _ => anyhow::bail!("native ETH requires both oracle RPC and pinned feed address"),
+            };
+            let direct_api = match (direct_api_url, direct_api_price_units) {
+                (Some(upstream_url), Some(price_units)) => {
+                    Some(zkapi_serverd::config::DirectApiConfig {
+                        upstream_url,
+                        price_units,
+                        timeout_ms: direct_api_timeout_ms,
+                    })
+                }
+                (Some(_), None) => {
+                    anyhow::bail!("--direct-api-url requires --direct-api-price-units")
+                }
+                (None, _) => None,
             };
             let config = ServerConfig {
                 protocol_version: cli.protocol_version,
@@ -507,6 +557,7 @@ async fn main() -> anyhow::Result<()> {
                 indexer_url,
                 root_poll_interval_ms,
                 openrouter_leases,
+                direct_api,
                 native_billing,
                 proof_setup_dir: cli.proof_setup_dir.clone(),
                 allow_legacy_clearance,

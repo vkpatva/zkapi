@@ -118,6 +118,11 @@ pub enum ServerError {
     #[error("chain state is unavailable: {0}; retry shortly")]
     ChainReadUnavailable(String),
 
+    /// A direct request's upstream API call failed. Nothing was reserved or
+    /// charged: the same request (and proof) can be retried.
+    #[error("the upstream API failed: {0}; retry shortly")]
+    UpstreamFailed(String),
+
     #[error(
         "OA org key issuance was rate limited ({reason}); retry after {retry_after_seconds} seconds"
     )]
@@ -156,6 +161,7 @@ impl ServerError {
             ServerError::RequestLimitExceeded { .. } => "request_limit_exceeded",
             ServerError::Published => "published",
             ServerError::ChainReadUnavailable(_) => "chain_read_unavailable",
+            ServerError::UpstreamFailed(_) => "upstream_failed",
         }
     }
 
@@ -191,6 +197,7 @@ impl ServerError {
             ServerError::RequestLimitExceeded { .. } => false,
             ServerError::Published => false,
             ServerError::ChainReadUnavailable(_) => true,
+            ServerError::UpstreamFailed(_) => true,
         }
     }
 }

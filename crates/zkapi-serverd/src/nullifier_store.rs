@@ -775,6 +775,8 @@ impl NullifierStore {
         conn.execute_batch(REQUEST_EVIDENCE_SCHEMA).map_err(|e| {
             ServerError::Database(format!("failed to create request_evidence: {e}"))
         })?;
+        conn.execute_batch(DIRECT_REQUESTS_SCHEMA)
+            .map_err(|e| ServerError::Database(format!("failed to create direct_requests: {e}")))?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS nullifiers_settled_unsigned
                 ON nullifiers(status, settled_charge);
@@ -1057,6 +1059,113 @@ impl NullifierStore {
         transaction
             .commit()
             .map_err(|e| ServerError::Database(format!("reservation commit failed: {e}")))
+    }
+
+    /// Reserve a verified direct request's nullifier already settled at
+    /// `settled` (kind "direct"), with its evidence row and its saved request,
+    /// in one transaction: a direct reservation is never unsettled, so the
+    /// challenger always finds what it owes. A nullifier reserved before is a
+    /// Replay.
+    pub fn reserve_direct_request(
+        &self,
+        request: &ApiRequestV2,
+        settled: &SettledCharge,
+    ) -> Result<(), ServerError> {
+        if settled.charge > request.public_inputs.solvency_bound {
+            return Err(ServerError::Internal(
+                "a direct charge cannot exceed the request's solvency bound".into(),
+            ));
+        }
+        let binding = api_request_binding(request)?;
+        request_proof_bytes(request)?;
+        let request_json = serde_json::to_string(request).map_err(|error| {
+            ServerError::Internal(format!("failed to encode the direct request: {error}"))
+        })?;
+        let failed = |error: rusqlite::Error| {
+            ServerError::Database(format!("direct reservation failed: {error}"))
+        };
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {}", e)))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        let now = current_timestamp();
+        let nullifier = request.public_inputs.request_nullifier.to_hex();
+        insert_reservation(
+            &transaction,
+            &request.public_inputs.request_nullifier,
+            &request.client_request_id,
+            &request.payload_hash,
+            "direct",
+            Some(&binding),
+            now,
+        )?;
+        insert_evidence(&transaction, request, "reserve", now)?;
+        transaction
+            .execute(
+                "UPDATE nullifiers SET settled_charge = ?1, settled_basis = ?2,
+                    settled_at = ?3, response_code = ?4, response_payload = ?5
+                 WHERE nullifier = ?6 AND status = 'Reserved' AND settled_charge IS NULL",
+                params![
+                    sql_charge(settled.charge)?,
+                    settled.basis,
+                    sql_time(settled.settled_at),
+                    i64::from(settled.response_code),
+                    settled.response_payload,
+                    nullifier,
+                ],
+            )
+            .map_err(failed)?;
+        transaction
+            .execute(
+                "INSERT INTO direct_requests (
+                    client_request_id, request_nullifier, api_request_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    request.client_request_id,
+                    nullifier,
+                    request_json,
+                    sql_time(now)
+                ],
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::SqliteFailure(ref err, _)
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    ServerError::Replay
+                }
+                error => failed(error),
+            })?;
+        transaction.commit().map_err(failed)
+    }
+
+    /// The saved request of a direct reservation, by client request ID.
+    pub fn try_lookup_direct_request(
+        &self,
+        client_request_id: &str,
+    ) -> Result<Option<ApiRequestV2>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT api_request_json FROM direct_requests WHERE client_request_id = ?1",
+                params![client_request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                ServerError::Database(format!("direct request lookup failed: {error}"))
+            })?;
+        json.map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                ServerError::Database(format!("direct request cannot be decoded: {error}"))
+            })
+        })
+        .transpose()
     }
 
     #[cfg(test)]
@@ -4018,6 +4127,15 @@ pub(crate) const REQUEST_EVIDENCE_SCHEMA: &str = "
         BEGIN SELECT RAISE(ABORT,'append-only'); END;
     CREATE TRIGGER IF NOT EXISTS request_evidence_no_delete BEFORE DELETE ON request_evidence
         BEGIN SELECT RAISE(ABORT,'append-only'); END;";
+
+/// The request of every direct reservation (`reserve_direct_request`), so
+/// that the signing pass can sign a successor the request path could not.
+pub(crate) const DIRECT_REQUESTS_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS direct_requests (
+        client_request_id TEXT PRIMARY KEY,
+        request_nullifier TEXT NOT NULL UNIQUE,
+        api_request_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL);";
 
 /// Every `request_evidence` column `row_to_evidence` reads.
 pub(crate) const REQUEST_EVIDENCE_COLUMNS: &[&str] = &[

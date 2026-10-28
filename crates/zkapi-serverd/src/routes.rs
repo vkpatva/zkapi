@@ -37,7 +37,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use zkapi_types::wire::{
     ApiRequestV2, ClearanceRequestV2C, ClearanceResponseV2, CurvePointWire, ErrorResponse,
-    OpenRouterLeaseStatusResponse, RecoveryResponseV2,
+    OpenRouterLeaseStatusResponse, RecoveryResponseV2, RequestResponseV2,
 };
 use zkapi_types::Felt252;
 
@@ -175,6 +175,13 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
         spawn_openrouter_lease_settler(
             processor.clone(),
             Duration::from_secs(lease.settlement_poll_seconds.max(1)),
+        );
+    } else if config.direct_api.is_some() {
+        // The lease settler's signing pass also signs direct requests; without
+        // it, retry the direct successors the request path could not sign.
+        spawn_direct_signer(
+            processor.clone(),
+            Duration::from_secs(crate::config::DEFAULT_DIRECT_SIGN_POLL_SECONDS),
         );
     }
     let router = create_router(processor);
@@ -779,6 +786,7 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
             "/v2/openrouter/leases/{client_request_id}/expire",
             post(handle_native_lease_expiry),
         )
+        .route("/v2/requests", post(handle_direct_request))
         .route("/v2/withdraw/clearance", post(handle_clearance))
         .route(
             "/v2/requests/{client_request_id}",
@@ -1009,6 +1017,26 @@ async fn handle_openrouter_lease(
         .issue_openrouter_lease(&api_request)
         .await
         .map(|response| (StatusCode::CREATED, Json(response)))
+        .map_err(|error| error_to_response(&error, &api_request.client_request_id, &processor))
+}
+
+/// A fixed-price direct request served by the operator's own API; 404 when
+/// this server serves no direct requests.
+async fn handle_direct_request(
+    State(processor): State<AppState>,
+    Json(api_request): Json<ApiRequestV2>,
+) -> Result<Json<RequestResponseV2>, ErrorHttpResponse> {
+    if !processor.direct_api_enabled() {
+        return Err(error_to_response(
+            &ServerError::InvalidRequest("this server does not serve direct requests".into()),
+            &api_request.client_request_id,
+            &processor,
+        ));
+    }
+    processor
+        .process_direct_request(&api_request)
+        .await
+        .map(Json)
         .map_err(|error| error_to_response(&error, &api_request.client_request_id, &processor))
 }
 
@@ -1334,6 +1362,7 @@ fn build_error_response(
         }
         ServerError::RequestLimitExceeded { .. } => StatusCode::BAD_REQUEST,
         ServerError::Published => StatusCode::GONE,
+        ServerError::UpstreamFailed(_) => StatusCode::BAD_GATEWAY,
     };
 
     let retry_after_seconds = match err {
@@ -1379,6 +1408,17 @@ fn spawn_openrouter_lease_settler(processor: Arc<RequestProcessor>, interval: Du
         loop {
             ticker.tick().await;
             processor.settle_due_openrouter_leases().await;
+        }
+    });
+}
+
+fn spawn_direct_signer(processor: Arc<RequestProcessor>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            processor.sign_settled_successors().await;
         }
     });
 }

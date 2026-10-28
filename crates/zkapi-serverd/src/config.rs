@@ -29,6 +29,52 @@ pub const RAISE_TIMING_SLACK_SECONDS: u64 = 1_200;
 /// its signature waits challengePeriod + this long for the consuming exit
 /// to be defeated before the request becomes ExitedUnsigned (O7).
 pub const EXIT_DEFERRAL_SLACK_SECONDS: u64 = 3_600;
+/// Default bound on one upstream call of a direct request.
+pub const DEFAULT_DIRECT_API_TIMEOUT_MS: u64 = 10_000;
+/// Default interval of the signing pass that retries direct requests whose
+/// successor could not be signed at once.
+pub const DEFAULT_DIRECT_SIGN_POLL_SECONDS: u64 = 5;
+
+/// Direct requests (`POST /v2/requests`): the operator serves the request from
+/// its own upstream API and charges a fixed price in vault units (whole gwei),
+/// so no provider lease and no price feed is involved. The successor is signed
+/// in the same response.
+#[derive(Clone, Debug)]
+pub struct DirectApiConfig {
+    /// The operator's own API: each admitted request's payload is POSTed here
+    /// as JSON, and its 2xx response body is returned in the response payload.
+    pub upstream_url: String,
+    /// The charge of every served request, in whole gwei. At most
+    /// `request_charge_cap`, which every admitted request's solvency bound
+    /// covers.
+    pub price_units: u128,
+    /// Bound on one upstream call; a request whose call fails is not charged.
+    pub timeout_ms: u64,
+}
+
+impl DirectApiConfig {
+    pub fn validate(&self, request_charge_cap: u128) -> anyhow::Result<()> {
+        let url = reqwest::Url::parse(&self.upstream_url)
+            .map_err(|error| anyhow::anyhow!("--direct-api-url is not a URL: {error}"))?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.fragment().is_none(),
+            "--direct-api-url must be an http(s) URL without credentials or a fragment"
+        );
+        anyhow::ensure!(
+            self.price_units > 0 && self.price_units <= request_charge_cap,
+            "--direct-api-price-units must be positive and at most the request charge cap \
+             ({request_charge_cap})"
+        );
+        anyhow::ensure!(
+            (1..=120_000).contains(&self.timeout_ms),
+            "--direct-api-timeout-ms must be between 1 and 120000"
+        );
+        Ok(())
+    }
+}
 
 /// Source used to provision prompt-private, short-lived OpenRouter keys.
 #[derive(Clone)]
@@ -268,9 +314,13 @@ pub struct ServerConfig {
     /// currentRoot() at the latest block hash, and checks the indexer's root
     /// when one is configured.
     pub root_poll_interval_ms: u64,
-    /// Required prompt-private OpenRouter lease configuration.
+    /// Prompt-private OpenRouter lease configuration. At least one of this
+    /// and `direct_api` is required.
     pub openrouter_leases: Option<OpenRouterLeaseConfig>,
-    /// Required native ETH oracle configuration, checked before server startup.
+    /// Fixed-price direct requests served by the operator's own API.
+    pub direct_api: Option<DirectApiConfig>,
+    /// Required vault RPC (and, for leases, the price feed), checked before
+    /// server startup.
     pub native_billing: Option<crate::native_billing::NativeBillingConfig>,
     /// Directory containing the v2 Groth16 proving/verifying key files.
     pub proof_setup_dir: String,
@@ -320,13 +370,17 @@ impl ServerConfig {
     /// Reject incomplete native configurations before startup opens any state.
     pub fn validate_native_mode(&self) -> anyhow::Result<()> {
         self.validate_testnet_auth()?;
+        let native = self
+            .native_billing
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native ETH billing configuration is required"))?;
         anyhow::ensure!(
-            self.native_billing.is_some(),
-            "native ETH billing configuration is required"
+            self.openrouter_leases.is_some() || self.direct_api.is_some(),
+            "native ETH requires prompt-private leases or direct requests"
         );
         anyhow::ensure!(
-            self.openrouter_leases.is_some(),
-            "native ETH requires prompt-private leases"
+            self.openrouter_leases.is_none() || !native.feed_address.is_empty(),
+            "prompt-private leases require the pinned price feed"
         );
         anyhow::ensure!(
             self.request_charge_cap > 0
@@ -351,6 +405,9 @@ impl ServerConfig {
                 .is_none_or(|max| max > 0 && max <= crate::native_billing::MAX_SAFE_UNITS),
             "--request-limit-max-usd-micros must be positive and browser-safe"
         );
+        if let Some(direct) = self.direct_api.as_ref() {
+            direct.validate(self.request_charge_cap)?;
+        }
         Ok(())
     }
 
@@ -440,6 +497,7 @@ impl std::fmt::Debug for ServerConfig {
             indexer_url,
             root_poll_interval_ms,
             openrouter_leases,
+            direct_api,
             native_billing,
             proof_setup_dir,
             allow_legacy_clearance,
@@ -465,6 +523,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("indexer_url", indexer_url)
             .field("root_poll_interval_ms", root_poll_interval_ms)
             .field("openrouter_leases", openrouter_leases)
+            .field("direct_api", direct_api)
             // NativeBillingConfig's Debug redacts its RPC URL (provider API keys).
             .field("native_billing", native_billing)
             .field("proof_setup_dir", proof_setup_dir)
@@ -501,6 +560,7 @@ impl Default for ServerConfig {
             indexer_url: None,
             root_poll_interval_ms: 1_000,
             openrouter_leases: None,
+            direct_api: None,
             native_billing: None,
             proof_setup_dir: "protocol/setup/v2-concession".to_string(),
             allow_legacy_clearance: false,
