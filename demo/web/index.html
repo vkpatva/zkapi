@@ -137,6 +137,17 @@
       </div>
     </section>
 
+    <section class="card" id="explorer-card">
+      <h2>Chain explorer</h2>
+      <p class="muted">Every transaction that touched the vault, read straight from Anvil, with each involved address's balance before and after its block. The sender's change includes gas.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Block</th><th>Time</th><th>Action</th><th>Tx</th><th>Balance changes</th></tr></thead>
+          <tbody id="txs"></tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="card">
       <h2>Activity</h2>
       <ol id="log" class="log"></ol>

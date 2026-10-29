@@ -221,6 +221,7 @@ const ANVIL_ROLES = { 0: 'vault owner', 2: 'treasury' };
 
 async function fillAccounts() {
     const accounts = await rpc('eth_accounts');
+    anvilAccounts = accounts.map(address => address.toLowerCase());
     fillSelect($('account-select'), accounts.map((address, index) =>
         [address.toLowerCase(), `#${index} ${address}${ANVIL_ROLES[index] ? ` (${ANVIL_ROLES[index]})` : ''}`]));
     if (!account) $('account-select').value = accounts[1].toLowerCase();
@@ -558,6 +559,7 @@ async function refreshOperator() {
     $('received').textContent = ethWei(treasury - ANVIL_START_WEI);
     $('vault-balance').textContent = ethWei(vault);
     await refreshServer().catch(error => log(`server dashboard: ${error.message}`, 'err'));
+    await refreshExplorer().catch(error => log(`explorer: ${error.message}`, 'err'));
     const logs = await rpc('eth_getLogs', [{ address: demo.contract_address, fromBlock: `0x${demo.deploy_block.toString(16)}`,
         toBlock: 'latest', topics: [NOTE_DEPOSITED_TOPIC] }]);
     claimableNotes = [];
@@ -602,6 +604,75 @@ async function refreshOperator() {
     // Re-render the wallet only when a note's vault status changed, so the
     // periodic refresh does not reset a dropdown the user has open.
     if (JSON.stringify([...chainStatus]) !== statusBefore) render();
+}
+
+// ------------------------------------------------------------------ explorer
+const ACTIONS = {
+    [ABI.deposit]: 'deposit',
+    [ABI.mutualClose]: 'mutualClose',
+    [ABI.initiateEscapeWithdrawal]: 'initiateEscapeWithdrawal',
+    [ABI.finalizeEscapeWithdrawal]: 'finalizeEscapeWithdrawal',
+    [ABI.claimExpired]: 'claimExpired',
+};
+// MutualClose, EscapeWithdrawalInitiated and EscapeWithdrawalFinalized carry
+// (nullifier, finalBalance, destination, ...): the destination is data word 2.
+const DESTINATION_EVENTS = new Set([ABI.mutualCloseEvent, ABI.escapeInitiatedEvent, ABI.escapeFinalizedEvent]);
+const explored = new Map(); // tx hash -> its table row
+let anvilAccounts = [];
+
+function addressLabel(address) {
+    const lower = address.toLowerCase();
+    if (lower === demo.contract_address) return 'vault';
+    if (lower === demo.treasury) return 'treasury';
+    const index = anvilAccounts.indexOf(lower);
+    const name = index >= 0 ? `#${index}${ANVIL_ROLES[index] ? ` ${ANVIL_ROLES[index]}` : ''}` : short(lower);
+    return lower === account ? `${name} (you)` : name;
+}
+
+async function exploreTx(hash) {
+    const [tx, mined] = await Promise.all([rpc('eth_getTransactionByHash', [hash]), rpc('eth_getTransactionReceipt', [hash])]);
+    const block = Number(BigInt(mined.blockNumber));
+    const involved = new Set([tx.from.toLowerCase(), demo.contract_address, demo.treasury]);
+    for (const entry of mined.logs) {
+        if (DESTINATION_EVENTS.has(entry.topics[0])) involved.add(`0x${entry.data.slice(2 + 2 * 64 + 24, 2 + 3 * 64)}`);
+    }
+    const changes = [];
+    for (const address of involved) {
+        const [before, after] = await Promise.all([
+            rpc('eth_getBalance', [address, `0x${(block - 1).toString(16)}`]),
+            rpc('eth_getBalance', [address, mined.blockNumber]),
+        ]);
+        const delta = BigInt(after) - BigInt(before);
+        if (delta !== 0n) changes.push({ address, before: BigInt(before), after: BigInt(after), delta });
+    }
+    const header = await rpc('eth_getBlockByNumber', [mined.blockNumber, false]);
+    const row = cellRow([String(block), new Date(Number(BigInt(header.timestamp)) * 1000).toLocaleTimeString(),
+        `${tx.to ? ACTIONS[tx.input.slice(2, 10)] ?? tx.input.slice(0, 10) : 'deploy'}${mined.status === '0x1' ? '' : ' (reverted)'}`, short(hash)],
+    ['', '', '', 'mono']);
+    const cell = document.createElement('td');
+    cell.className = 'changes';
+    for (const change of changes) {
+        const line = document.createElement('div');
+        const sign = change.delta > 0n ? '+' : '−';
+        const amount = change.delta > 0n ? change.delta : -change.delta;
+        const delta = document.createElement('span');
+        delta.className = change.delta > 0n ? 'plus' : 'minus';
+        // Gas alone is far below 0.0001 ETH: show small changes in gwei.
+        delta.textContent = amount < 100_000n * GWEI ? `${sign}${(Number(amount) / 1e9).toFixed(0)} gwei` : `${sign}${ethWei(amount)}`;
+        line.append(`${addressLabel(change.address)}: ${ethWei(change.before)} → ${ethWei(change.after)} `, delta);
+        cell.append(line);
+    }
+    row.append(cell);
+    return { block, row };
+}
+
+async function refreshExplorer() {
+    const logs = await rpc('eth_getLogs', [{ address: demo.contract_address, fromBlock: `0x${demo.deploy_block.toString(16)}`, toBlock: 'latest' }]);
+    const hashes = [...new Set(logs.map(entry => entry.transactionHash))].filter(hash => !explored.has(hash));
+    if (!hashes.length) return;
+    for (const hash of hashes) explored.set(hash, await exploreTx(hash));
+    const rows = [...explored.values()].sort((a, b) => b.block - a.block).map(entry => entry.row);
+    $('txs').replaceChildren(...rows);
 }
 
 async function skipTime(seconds, label) {

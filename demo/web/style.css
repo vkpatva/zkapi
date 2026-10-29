@@ -92,3 +92,7 @@ td.mono { font-family: ui-monospace, monospace; font-size: 12px; }
 .pill.closed, .pill.claimed { color: var(--muted); }
 .pill.expired { color: var(--err); border-color: var(--err); }
 #accounts td.mono { white-space: normal; word-break: break-all; }
+#txs td { vertical-align: top; }
+#txs .changes { white-space: normal; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.6; }
+#txs .plus { color: var(--ok); }
+#txs .minus { color: var(--err); }
