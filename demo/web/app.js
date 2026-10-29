@@ -20,7 +20,7 @@ const GWEI = 1_000_000_000n;
 let demo;           // /config.json, written by demo-up.mjs
 let walletConfig;   // BrowserWalletConfig for the prover
 let account = null;
-let storageKey;
+let walletPrefix;   // storage key of this vault's wallets; one per account
 
 // ------------------------------------------------------------------ worker
 const worker = new Worker('/worker.js', { type: 'module' });
@@ -73,10 +73,16 @@ let chainOffset = 0; // chain time minus wall time, refreshed by the operator vi
 // `state` is the prover's BrowserNoteState, `pending` a prepared request not
 // yet answered, `exit` its withdrawal. The single-note layout of earlier
 // builds ({ state, pending, exit }) is migrated on load.
+// Each connected address keeps its own notes, so several addresses act as
+// separate users. (A note is a bearer secret: nothing on chain ties it to
+// the address that deposited it.)
+const storageKey = () => (account ? `${walletPrefix}:${account.toLowerCase()}` : null);
+
 function load() {
+    if (!account) return { notes: {} };
     let wallet;
     try {
-        wallet = JSON.parse(localStorage.getItem(storageKey) ?? 'null');
+        wallet = JSON.parse(localStorage.getItem(storageKey()) ?? 'null');
     } catch {
         wallet = null;
     }
@@ -85,7 +91,8 @@ function load() {
 }
 
 function save(wallet) {
-    localStorage.setItem(storageKey, JSON.stringify(wallet));
+    if (!account) throw new Error('Connect an account first.');
+    localStorage.setItem(storageKey(), JSON.stringify(wallet));
     render();
 }
 
@@ -145,9 +152,9 @@ function render() {
     const open = notes.filter(isOpen);
     const total = open.reduce((sum, note) => sum + BigInt(note.state.current_balance), 0n);
     $('balance').textContent = notes.length ? eth(total) : '—';
-    $('note-info').textContent = notes.length
-        ? `Private balance across ${open.length} open note${open.length === 1 ? '' : 's'} · ${notes.length - open.length} closed`
-        : 'No notes yet: deposit to create one.';
+    $('note-info').textContent = !account ? 'Connect an account to see its notes.' : notes.length
+        ? `Private balance across ${open.length} open note${open.length === 1 ? '' : 's'} of ${account.slice(0, 8)}… · ${notes.length - open.length} closed`
+        : `No notes for ${account.slice(0, 8)}… yet: deposit to create one.`;
     $('price').textContent = `Each search costs ${eth(demo.price_units)}; the paying note needs at least ${eth(demo.request_charge_cap)}.`;
 
     $('my-notes').replaceChildren(...notes.slice().reverse().map(note => {
@@ -208,23 +215,45 @@ function tick() {
 }
 
 // ------------------------------------------------------------------ wallet
+// Anvil's ten default accounts are unlocked and funded; label the two the
+// deployment uses.
+const ANVIL_ROLES = { 0: 'vault owner', 2: 'treasury' };
+
+async function fillAccounts() {
+    const accounts = await rpc('eth_accounts');
+    fillSelect($('account-select'), accounts.map((address, index) =>
+        [address.toLowerCase(), `#${index} ${address}${ANVIL_ROLES[index] ? ` (${ANVIL_ROLES[index]})` : ''}`]));
+    if (!account) $('account-select').value = accounts[1].toLowerCase();
+}
+
+async function useAccount(address, how) {
+    account = address.toLowerCase();
+    const balance = BigInt(await rpc('eth_getBalance', [account, 'latest']));
+    $('account').textContent = `${account} · ${(Number(balance / GWEI) / 1e9).toFixed(3)} ETH on chain · ${how}`;
+    $('results').replaceChildren();
+    $('exit-result').textContent = '';
+    log(`using ${account} (${myNotes().length} note${myNotes().length === 1 ? '' : 's'} in this browser)`, 'ok');
+    render();
+    await refreshOperator();
+}
+
 async function connect() {
     const mode = $('wallet-mode').value;
+    $('account-row').hidden = mode !== 'anvil';
     if (mode === 'injected') {
         if (!window.ethereum) throw new Error('No browser wallet found. Choose the Anvil test account instead.');
-        [account] = await window.ethereum.request({ method: 'eth_requestAccounts' });
+        const [selected] = await window.ethereum.request({ method: 'eth_requestAccounts' });
         const chainId = Number(await window.ethereum.request({ method: 'eth_chainId' }));
         if (chainId !== demo.chain_id) {
             throw new Error(`Switch the wallet to the local Anvil network (chain ${demo.chain_id}, RPC ${demo.rpc_url}).`);
         }
+        // Switching accounts in the extension switches the page's wallet too.
+        window.ethereum.removeAllListeners?.('accountsChanged');
+        window.ethereum.on?.('accountsChanged', ([next]) => next && useAccount(next, 'browser wallet').catch(error => log(error.message, 'err')));
+        await useAccount(selected, 'browser wallet');
     } else {
-        // Anvil's default accounts are unlocked: account 1 (account 0 deployed the vault).
-        account = (await rpc('eth_accounts'))[1];
+        await useAccount($('account-select').value, 'Anvil test account');
     }
-    const balance = BigInt(await rpc('eth_getBalance', [account, 'latest']));
-    $('account').textContent = `${account} · ${(Number(balance / GWEI) / 1e9).toFixed(3)} ETH on chain`;
-    log(`connected ${account}`, 'ok');
-    render();
 }
 
 async function sendTransaction(tx) {
@@ -601,7 +630,7 @@ function guarded(button, action) {
 
 async function main() {
     demo = await getJSON('/config.json');
-    storageKey = `zkapi-demo:${demo.chain_id}:${demo.contract_address}`;
+    walletPrefix = `zkapi-demo:${demo.chain_id}:${demo.contract_address}`;
     walletConfig = {
         protocol_version: 2,
         chain_id: demo.chain_id,
@@ -613,6 +642,8 @@ async function main() {
         clearance_signing_key: demo.clearance_signing_key,
     };
     $('connect').onclick = guarded($('connect'), connect);
+    $('account-select').onchange = guarded($('account-select'), connect);
+    $('wallet-mode').onchange = () => { $('account-row').hidden = $('wallet-mode').value !== 'anvil'; };
     $('deposit').onclick = guarded($('deposit'), deposit);
     $('search-form').onsubmit = guarded($('search'), async () => {
         const query = $('query').value.trim();
@@ -631,12 +662,14 @@ async function main() {
     });
     $('withdraw-note').onchange = render;
     $('reset').onclick = () => {
-        if (confirm('Forget every note? Their secrets are only in this browser: open notes become unspendable from here.')) {
-            localStorage.removeItem(storageKey);
+        if (!account) return;
+        if (confirm(`Forget every note of ${account}? Their secrets are only in this browser: open notes become unspendable from here.`)) {
+            localStorage.removeItem(storageKey());
             render();
-            log('all notes forgotten');
+            log(`all notes of ${account} forgotten`);
         }
     };
+    await fillAccounts();
     render();
     setInterval(tick, 1_000);
     setInterval(() => refreshOperator().catch(() => {}), 5_000);
