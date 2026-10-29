@@ -80,14 +80,14 @@
             <h2><span class="step">2</span>Deposit</h2>
             <p class="muted small">Each deposit is a new private note. Only this browser holds its secret.</p>
             <div class="presets" id="presets">
-              <button type="button" class="preset" data-eth="0.01">0.01</button>
-              <button type="button" class="preset" data-eth="0.05">0.05</button>
-              <button type="button" class="preset" data-eth="0.1">0.1</button>
               <button type="button" class="preset" data-eth="1">1</button>
+              <button type="button" class="preset" data-eth="2">2</button>
+              <button type="button" class="preset" data-eth="5">5</button>
+              <button type="button" class="preset" data-eth="10">10</button>
             </div>
             <div class="row">
               <div class="amount">
-                <input id="deposit-eth" type="number" min="0.001" step="0.001" value="0.01" aria-label="Deposit in ETH">
+                <input id="deposit-eth" type="number" min="0" step="any" value="2" aria-label="Deposit in ETH">
                 <span>ETH</span>
               </div>
               <button id="deposit" disabled>Deposit</button>

@@ -3,7 +3,7 @@
 // with the development setup, the indexer, `zkapi serverd` serving
 // fixed-price direct requests from the demo search API, and the web page.
 //
-//   node demo/scripts/demo-up.mjs [--skip-build] [--fresh]
+//   node demo/scripts/demo-up.mjs [--skip-build] [--fresh] [--price-eth 1]
 //
 // Then open http://127.0.0.1:5173. Ctrl-C stops everything. Logs and state
 // are in demo/.local/ (--fresh deletes them first). Development keys only:
@@ -24,10 +24,18 @@ const PORTS = { anvil: 8545, server: 8787, indexer: 8788, search: 8090, web: 517
 const RPC_URL = `http://127.0.0.1:${PORTS.anvil}`;
 // Anvil's first default account deploys and owns the vault.
 const DEPLOYER_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
-// Whole gwei: a search costs 0.0001 ETH, and every request proves a balance of
-// at least the cap, so a 0.01 ETH deposit pays for 99 searches.
-const REQUEST_CHARGE_CAP = 100_000;
-const PRICE_UNITS = 100_000;
+// The price of a search (--price-eth, default 1 ETH), in the vault's whole
+// gwei. Every request proves a balance of at least the cap, which equals the
+// price, and the minimum deposit is one search.
+const priceIndex = process.argv.indexOf('--price-eth');
+const PRICE_ETH = priceIndex > 0 ? Number(process.argv[priceIndex + 1]) : 1;
+const PRICE_UNITS = Math.round(PRICE_ETH * 1e9);
+if (!(PRICE_UNITS >= 1 && PRICE_UNITS <= Number.MAX_SAFE_INTEGER)) {
+    console.error('--price-eth must be between 1 gwei and about 9 million ETH');
+    process.exit(1);
+}
+const REQUEST_CHARGE_CAP = PRICE_UNITS;
+const MIN_DEPOSIT = PRICE_UNITS;
 // Demo timing, in seconds. The vault still rounds every expiry up to the next
 // UTC midnight (EXPIRY_BUCKET, a protocol constant that hides deposit times),
 // so the page can skip Anvil's clock forward to show an expiry.
@@ -173,7 +181,7 @@ run('forge', ['script', 'script/Deploy.s.sol', '--rpc-url', RPC_URL, '--broadcas
         OUTPUT_PATH: finalizedPath, SETUP_MANIFEST: path.join(SETUP_DIR, 'manifest.json'),
         STATE_SIGNING_KEY_X: signingKeys.state_signing_key.x, STATE_SIGNING_KEY_Y: signingKeys.state_signing_key.y,
         CLEARANCE_SIGNING_KEY_X: signingKeys.clearance_signing_key.x, CLEARANCE_SIGNING_KEY_Y: signingKeys.clearance_signing_key.y,
-        REQUEST_CHARGE_CAP: String(REQUEST_CHARGE_CAP), GASLESS: '0', TREASURY,
+        REQUEST_CHARGE_CAP: String(REQUEST_CHARGE_CAP), MIN_DEPOSIT: String(MIN_DEPOSIT), GASLESS: '0', TREASURY,
         NOTE_TTL_SECONDS: String(NOTE_TTL_SECONDS), CHALLENGE_PERIOD_SECONDS: String(CHALLENGE_PERIOD_SECONDS),
         MAX_PAUSE_DURATION_SECONDS: String(MAX_PAUSE_DURATION_SECONDS),
     },
@@ -240,7 +248,7 @@ await waitFor('the web page', () => fetch(`http://127.0.0.1:${PORTS.web}/`).then
 log('ready');
 console.log(`
   Web page      http://127.0.0.1:${PORTS.web}
-  Server        ${serverUrl}   (POST /v2/requests, ${PRICE_UNITS} gwei per search)
+  Server        ${serverUrl}   (POST /v2/requests, ${PRICE_ETH} ETH per search)
   Indexer       ${indexerUrl}
   Search API    http://127.0.0.1:${PORTS.search}/search
   Anvil         ${RPC_URL}  (chain ${CHAIN_ID})

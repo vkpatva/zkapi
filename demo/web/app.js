@@ -252,7 +252,14 @@ async function fillAccounts() {
 async function useAccount(address, how) {
     account = address.toLowerCase();
     const balance = BigInt(await rpc('eth_getBalance', [account, 'latest']));
-    $('account').textContent = `${account} · ${(Number(balance / GWEI) / 1e9).toFixed(3)} ETH on chain · ${how}`;
+    $('account').textContent = `${account} · ${(Number(balance / GWEI) / 1e9).toFixed(4)} ETH on chain · ${how}`;
+    // The operator's own accounts: deposits and payouts there mix with its revenue.
+    const role = account === demo.treasury ? 'the treasury: the operator\'s share of every note lands here too, so its balance barely moves'
+        : account === anvilAccounts[0] ? 'the vault owner' : null;
+    if (role) {
+        $('account').textContent += ` — ⚠ this is ${role}. Pick #1 or #3–#9 to act as a user.`;
+        log(`⚠ ${account} is ${role}`, 'err');
+    }
     $('results').replaceChildren();
     $('receipt').hidden = true;
     $('exit-result').textContent = '';
