@@ -28,6 +28,15 @@ const DEPLOYER_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7b
 // at least the cap, so a 0.01 ETH deposit pays for 99 searches.
 const REQUEST_CHARGE_CAP = 100_000;
 const PRICE_UNITS = 100_000;
+// Demo timing, in seconds. The vault still rounds every expiry up to the next
+// UTC midnight (EXPIRY_BUCKET, a protocol constant that hides deposit times),
+// so the page can skip Anvil's clock forward to show an expiry.
+const NOTE_TTL_SECONDS = 3_600;
+const CHALLENGE_PERIOD_SECONDS = 120;
+const MAX_PAUSE_DURATION_SECONDS = 2 * CHALLENGE_PERIOD_SECONDS;
+// Anvil account 2 receives the operator's share; the page deposits from
+// account 1, so the two flows stay apart.
+const TREASURY = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC';
 // Never read in direct mode; the deployment profile requires a feed address.
 const UNUSED_PRICE_FEED = '0x0000000000000000000000000000000000000001';
 
@@ -164,7 +173,9 @@ run('forge', ['script', 'script/Deploy.s.sol', '--rpc-url', RPC_URL, '--broadcas
         OUTPUT_PATH: finalizedPath, SETUP_MANIFEST: path.join(SETUP_DIR, 'manifest.json'),
         STATE_SIGNING_KEY_X: signingKeys.state_signing_key.x, STATE_SIGNING_KEY_Y: signingKeys.state_signing_key.y,
         CLEARANCE_SIGNING_KEY_X: signingKeys.clearance_signing_key.x, CLEARANCE_SIGNING_KEY_Y: signingKeys.clearance_signing_key.y,
-        REQUEST_CHARGE_CAP: String(REQUEST_CHARGE_CAP), GASLESS: '0',
+        REQUEST_CHARGE_CAP: String(REQUEST_CHARGE_CAP), GASLESS: '0', TREASURY,
+        NOTE_TTL_SECONDS: String(NOTE_TTL_SECONDS), CHALLENGE_PERIOD_SECONDS: String(CHALLENGE_PERIOD_SECONDS),
+        MAX_PAUSE_DURATION_SECONDS: String(MAX_PAUSE_DURATION_SECONDS),
     },
 });
 run(process.execPath, [path.join(ROOT, 'scripts/expected-codehashes.mjs'), '--deployment', pendingPath, '--rpc', RPC_URL,
@@ -183,6 +194,8 @@ run(process.execPath, [path.join(ROOT, 'scripts/deployment-profile.mjs'), '--fin
     '--settlement-window-seconds', '60', '--out', profilePath], { label: 'write the deployment profile' });
 
 // ------------------------------------------------------------------ daemons
+// Every run starts a fresh chain: drop the previous run's indexer checkpoint.
+fs.rmSync(path.join(LOCAL, 'indexer.json'), { force: true });
 launch('indexer', path.join(BIN, 'zkapi-indexerd'), ['--listen', `127.0.0.1:${PORTS.indexer}`, '--rpc-url', RPC_URL,
     '--contract-address', vault, '--from-block', String(finalized.deployBlock), '--poll-interval-ms', '500',
     '--chain-id', String(CHAIN_ID), '--confirmations', '0', '--max-head-age-secs', '0',
@@ -212,6 +225,9 @@ const web = {
     request_charge_cap: REQUEST_CHARGE_CAP,
     price_units: PRICE_UNITS,
     min_deposit_units: finalized.minDeposit,
+    note_ttl: finalized.noteTtl,
+    challenge_period: finalized.challengePeriod,
+    treasury: finalized.treasury.toLowerCase(),
     state_signing_key: { x: signingKeys.state_signing_key.x, y: signingKeys.state_signing_key.y },
     clearance_signing_key: { x: signingKeys.clearance_signing_key.x, y: signingKeys.clearance_signing_key.y },
 };
@@ -229,6 +245,8 @@ console.log(`
   Search API    http://127.0.0.1:${PORTS.search}/search
   Anvil         ${RPC_URL}  (chain ${CHAIN_ID})
   Vault         ${vault}
+  Treasury      ${TREASURY} (Anvil account 2)
+  Timing        note TTL ${NOTE_TTL_SECONDS} s (expiry rounds up to UTC midnight), challenge period ${CHALLENGE_PERIOD_SECONDS} s
   Logs          demo/.local/*.log
 
   Ctrl-C stops everything.

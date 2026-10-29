@@ -5,7 +5,7 @@
 //   /api/server/*   -> DEMO_SERVER_URL   (zkapi serverd)
 //   /api/indexer/*  -> DEMO_INDEXER_URL  (zkapi-indexerd)
 //   /rpc            -> DEMO_RPC_URL      (Anvil; JSON-RPC POST only)
-//   /wasm/*, /proofs/request.pk          the browser prover from sdk/
+//   /wasm/*, /proofs/*.pk, /sdk/wallet.js the browser prover and vault codec from sdk/
 //   /config.json                         demo/.local/web-config.json
 //
 // Usage: node demo/web/serve.mjs [--port 5173]
@@ -33,6 +33,9 @@ const files = {
     '/wasm/zkapi_browser.js': path.join(ROOT, 'sdk/wasm/zkapi_browser.js'),
     '/wasm/zkapi_browser_bg.wasm': path.join(ROOT, 'sdk/wasm/zkapi_browser_bg.wasm'),
     '/proofs/request.pk': path.join(ROOT, 'sdk/assets/proofs/request.pk'),
+    '/proofs/withdrawal.pk': path.join(ROOT, 'sdk/assets/proofs/withdrawal.pk'),
+    // The SDK's dependency-free vault ABI codec (withdrawal calldata, decoders).
+    '/sdk/wallet.js': path.join(ROOT, 'sdk/wallet.js'),
 };
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css',
     '.json': 'application/json', '.wasm': 'application/wasm', '.pk': 'application/octet-stream' };
@@ -63,7 +66,7 @@ async function proxy(request, response, target) {
     }
 }
 
-http.createServer(async (request, response) => {
+const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, 'http://localhost');
     for (const [prefix, base] of Object.entries(upstreams)) {
         if (url.pathname.startsWith(prefix)) {
@@ -78,4 +81,9 @@ http.createServer(async (request, response) => {
     }
     response.writeHead(200, { 'content-type': types[path.extname(file)] ?? types['.html'], 'cache-control': 'no-store' });
     fs.createReadStream(file).pipe(response);
-}).listen(port, '127.0.0.1', () => console.log(`demo web page on http://127.0.0.1:${port}`));
+});
+// Proofs take seconds between requests: keep idle connections open longer than
+// Node's 5 s default, so a client reusing one never races its close.
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+server.listen(port, '127.0.0.1', () => console.log(`demo web page on http://127.0.0.1:${port}`));

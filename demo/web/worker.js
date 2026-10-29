@@ -4,6 +4,12 @@
 import init, * as wasm from '/wasm/zkapi_browser.js';
 
 let prover = null;
+let withdrawalKey = null;
+
+async function withdrawalProvingKey() {
+    withdrawalKey ??= new Uint8Array(await (await fetch('/proofs/withdrawal.pk')).arrayBuffer());
+    return withdrawalKey;
+}
 
 async function ready() {
     if (prover) return prover;
@@ -20,6 +26,11 @@ const calls = {
     treePath: async ({ snapshot, noteId }) => (await ready(), wasm.browser_tree_path(snapshot, noteId, true)),
     prepareRequest: async ({ config, state, args }) => (await ready()).prepare_request(config, state, args),
     completeResponse: async ({ config, args }) => (await ready(), wasm.browser_complete_response(config, args)),
+    // mode "ownership" (for the server's clearance), "mutual" or "escape".
+    prepareWithdrawal: async ({ config, state, args }) => {
+        await ready();
+        return wasm.browser_prepare_withdrawal(config, state, args, await withdrawalProvingKey());
+    },
     walletStatus: async ({ state }) => (await ready(), wasm.browser_wallet_status(state, undefined)),
 };
 

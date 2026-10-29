@@ -53,6 +53,51 @@
       <ol id="results"></ol>
     </section>
 
+    <section class="card" id="withdraw-card">
+      <h2>4 · Withdraw</h2>
+      <p class="muted">Take the remaining balance out of the vault. The operator receives what you spent.</p>
+      <div class="row">
+        <label for="destination">Pay to</label>
+        <input id="destination" class="address" placeholder="0x… (defaults to the connected account)" autocomplete="off">
+      </div>
+      <div class="options">
+        <div class="option">
+          <button id="mutual">Mutual close</button>
+          <p class="muted">Normal exit. The operator co-signs your final balance; paid in one transaction, no waiting.</p>
+        </div>
+        <div class="option">
+          <button id="escape" class="secondary-solid">Escape</button>
+          <p class="muted">Exit without the operator (if it is offline or refuses). Paid after the challenge period, during which the operator can contest a stale state.</p>
+        </div>
+      </div>
+      <div id="escape-status" hidden>
+        <p id="escape-text"></p>
+        <button id="finalize" disabled>Finalize escape</button>
+      </div>
+      <p class="muted" id="exit-result"></p>
+    </section>
+
+    <section class="card" id="operator-card">
+      <h2>Operator view</h2>
+      <p class="muted">What the vault owner sees and can do. Anyone can trigger these calls; the money always goes to the treasury.</p>
+      <dl class="stats">
+        <div><dt>Treasury</dt><dd id="treasury-balance">—</dd></div>
+        <div><dt>Vault holds</dt><dd id="vault-balance">—</dd></div>
+        <div><dt>Chain time</dt><dd id="chain-time">—</dd></div>
+      </dl>
+      <div class="row">
+        <button id="skip-hour" class="secondary-solid">Skip chain time +1 h</button>
+        <button id="skip-expiry" class="secondary-solid">Skip past the next expiry</button>
+        <button id="refresh-notes" class="secondary-solid">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Note</th><th>Deposit</th><th>Status</th><th>Claimable from</th><th></th></tr></thead>
+          <tbody id="notes"></tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="card">
       <h2>Activity</h2>
       <ol id="log" class="log"></ol>
