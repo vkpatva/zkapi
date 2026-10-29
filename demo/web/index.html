@@ -177,10 +177,10 @@
 
       <div class="card">
         <h2>What the operator sees</h2>
-        <p class="muted small">The server's own record of served searches: queries, nullifiers and charges. No address, no note, nothing linking two searches.</p>
+        <p class="muted small">The server's own record of served searches: queries, nullifiers and charges. No address, no note, nothing linking two searches. Each proof only shows that its payer owns <em>one</em> of the notes under the root: searches made at the same root are indistinguishable.</p>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Time</th><th>Query</th><th>Nullifier</th><th class="num">Charge</th></tr></thead>
+            <thead><tr><th>Time</th><th>Query</th><th>Nullifier</th><th>Proved against root</th><th class="num">Charge</th></tr></thead>
             <tbody id="seen"></tbody>
           </table>
         </div>

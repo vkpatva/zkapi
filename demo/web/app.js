@@ -566,8 +566,8 @@ async function refreshServer() {
         } catch {
             // not JSON: show it as sent
         }
-        return cellRow([new Date(event.ts_ms).toLocaleTimeString(), query, short(event.request_nullifier), eth(event.charge_applied)],
-            ['', '', 'mono', 'num']);
+        return cellRow([new Date(event.ts_ms).toLocaleTimeString(), query, short(event.request_nullifier), short(event.active_root),
+            eth(event.charge_applied)], ['', '', 'mono', 'mono', 'num']);
     }));
 }
 
@@ -674,13 +674,14 @@ const DESTINATION_EVENTS = new Set([ABI.mutualCloseEvent, ABI.escapeInitiatedEve
 const explored = new Map(); // tx hash -> its table row
 let anvilAccounts = [];
 
-function addressLabel(address) {
+/** A readable name for an address; `you` marks the connected account (not in the explorer, whose rows outlive a switch). */
+function addressLabel(address, you = true) {
     const lower = address.toLowerCase();
     if (lower === demo.contract_address) return 'vault';
     if (lower === demo.treasury) return 'treasury';
     const index = anvilAccounts.indexOf(lower);
     const name = index >= 0 ? `#${index}${ANVIL_ROLES[index] ? ` ${ANVIL_ROLES[index]}` : ''}` : short(lower);
-    return lower === account ? `${name} (you)` : name;
+    return you && lower === account ? `${name} (you)` : name;
 }
 
 async function exploreTx(hash) {
@@ -714,7 +715,7 @@ async function exploreTx(hash) {
         // Gas alone is far below 0.0001 ETH: show small changes in gwei.
         delta.textContent = amount < GWEI ? `${sign}<1 gwei (gas)`
             : amount < 100_000n * GWEI ? `${sign}${(Number(amount) / 1e9).toFixed(0)} gwei` : `${sign}${ethWei(amount)}`;
-        line.append(`${addressLabel(change.address)}: ${ethWei(change.before)} → ${ethWei(change.after)} `, delta);
+        line.append(`${addressLabel(change.address, false)}: ${ethWei(change.before)} → ${ethWei(change.after)} `, delta);
         cell.append(line);
     }
     row.append(cell);
