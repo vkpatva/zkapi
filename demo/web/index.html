@@ -80,11 +80,36 @@
     <section class="card" id="operator-card">
       <h2>Operator view</h2>
       <p class="muted">What the vault owner sees and can do. Anyone can trigger these calls; the money always goes to the treasury.</p>
+      <h3>Accounts</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Role</th><th>Address</th><th class="num">Balance</th></tr></thead>
+          <tbody id="accounts"></tbody>
+        </table>
+      </div>
+
+      <h3>Operator revenue</h3>
       <dl class="stats">
-        <div><dt>Treasury</dt><dd id="treasury-balance">—</dd></div>
-        <div><dt>Vault holds</dt><dd id="vault-balance">—</dd></div>
-        <div><dt>Chain time</dt><dd id="chain-time">—</dd></div>
+        <div><dt>Searches served</dt><dd id="served">—</dd></div>
+        <div><dt>Charged (signed into balances)</dt><dd id="charged">—</dd></div>
+        <div><dt>Received by the treasury</dt><dd id="received">—</dd></div>
+        <div><dt>Still in the vault</dt><dd id="vault-balance">—</dd></div>
       </dl>
+      <p class="muted">Charges move to the treasury only when a note closes (its spent part) or expires (all of it).</p>
+
+      <h3>Vault parameters</h3>
+      <dl class="stats" id="params"></dl>
+
+      <h3>What the operator sees</h3>
+      <p class="muted">The server's own record of served searches: queries, nullifiers and charges. No address, no note, nothing linking two searches.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Time</th><th>Query</th><th>Nullifier</th><th class="num">Charge</th></tr></thead>
+          <tbody id="seen"></tbody>
+        </table>
+      </div>
+
+      <h3>Notes</h3>
       <div class="row">
         <button id="skip-hour" class="secondary-solid">Skip chain time +1 h</button>
         <button id="skip-expiry" class="secondary-solid">Skip past the next expiry</button>

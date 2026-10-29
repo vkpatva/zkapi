@@ -348,16 +348,86 @@ async function operatorSend(data, label) {
     log(`${label} (${hash})`, 'ok');
 }
 
-async function refreshOperator() {
-    const [treasury, vaultBalance, now] = await Promise.all([
-        rpc('eth_getBalance', [demo.treasury, 'latest']),
-        rpc('eth_getBalance', [demo.contract_address, 'latest']),
-        chainNow(),
+// Every Anvil account starts with 10,000 ETH; the treasury only receives.
+const ANVIL_START_WEI = 10_000n * 10n ** 18n;
+const ethWei = wei => `${(Number(BigInt(wei) / GWEI) / 1e9).toFixed(4)} ETH`;
+const short = hex => `${hex.slice(0, 10)}…${hex.slice(-6)}`;
+
+function cellRow(values, classes = []) {
+    const row = document.createElement('tr');
+    values.forEach((value, index) => {
+        const cell = document.createElement('td');
+        cell.textContent = value;
+        if (classes[index]) cell.className = classes[index];
+        row.append(cell);
+    });
+    return row;
+}
+
+async function refreshAccounts() {
+    const owner = `0x${(await ethCall(demo.contract_address, '0x8da5cb5b')).slice(-40)}`; // owner()
+    const payout = $('destination').value.trim().toLowerCase();
+    const accounts = [
+        ['Vault owner (deployed the vault; can pause)', owner],
+        ['Treasury (receives the operator\'s share)', demo.treasury],
+        ['Vault contract (holds all deposits)', demo.contract_address],
+    ];
+    if (account) accounts.push(['You (pays deposits, receives withdrawals)', account]);
+    if (/^0x[0-9a-f]{40}$/.test(payout) && payout !== account?.toLowerCase()) accounts.push(['Payout destination', payout]);
+    const balances = await Promise.all(accounts.map(([, address]) => rpc('eth_getBalance', [address, 'latest'])));
+    $('accounts').replaceChildren(...accounts.map(([role, address], index) =>
+        cellRow([role, address, ethWei(balances[index])], ['', 'mono', 'num'])));
+    return { treasury: BigInt(balances[1]), vault: BigInt(balances[2]) };
+}
+
+async function refreshServer() {
+    const [summary, recent] = await Promise.all([
+        getJSON('/api/server/v1/dashboard/summary'),
+        getJSON('/api/server/v1/dashboard/recent'),
     ]);
+    $('served').textContent = String(summary.totals.request_count);
+    $('charged').textContent = eth(summary.totals.total_gwei_charged);
+    $('seen').replaceChildren(...recent.slice().reverse().slice(0, 20).map(event => {
+        let query = event.request_raw;
+        try {
+            query = JSON.parse(event.request_raw).query ?? query;
+        } catch {
+            // not JSON: show it as sent
+        }
+        return cellRow([new Date(event.ts_ms).toLocaleTimeString(), query, short(event.request_nullifier), eth(event.charge_applied)],
+            ['', '', 'mono', 'num']);
+    }));
+}
+
+function renderParams(now) {
+    const params = [
+        ['Price per search', eth(demo.price_units)],
+        ['Balance needed per search', eth(demo.request_charge_cap)],
+        ['Minimum deposit', eth(demo.min_deposit_units)],
+        ['Note TTL', `${demo.note_ttl / 60} min, rounded up to UTC midnight`],
+        ['Challenge period', `${demo.challenge_period} s`],
+        ['Chain', `${demo.chain_id} (Anvil)`],
+        ['Chain time', `${new Date(now * 1000).toLocaleString()}${chainOffset > 60 ? ` (+${Math.round(chainOffset / 60)} min ahead)` : ''}`],
+    ];
+    $('params').replaceChildren(...params.map(([name, value]) => {
+        const item = document.createElement('div');
+        const term = document.createElement('dt');
+        term.textContent = name;
+        const detail = document.createElement('dd');
+        detail.textContent = value;
+        item.append(term, detail);
+        return item;
+    }));
+}
+
+async function refreshOperator() {
+    const now = await chainNow();
     chainOffset = now - nowSeconds();
-    $('treasury-balance').textContent = `${(Number(BigInt(treasury) / GWEI) / 1e9).toFixed(4)} ETH`;
-    $('vault-balance').textContent = `${(Number(BigInt(vaultBalance) / GWEI) / 1e9).toFixed(4)} ETH`;
-    $('chain-time').textContent = `${new Date(now * 1000).toLocaleString()}${chainOffset > 60 ? ` (+${Math.round(chainOffset / 60)} min)` : ''}`;
+    renderParams(now);
+    const { treasury, vault } = await refreshAccounts();
+    $('received').textContent = ethWei(treasury - ANVIL_START_WEI);
+    $('vault-balance').textContent = ethWei(vault);
+    await refreshServer().catch(error => log(`server dashboard: ${error.message}`, 'err'));
     const logs = await rpc('eth_getLogs', [{ address: demo.contract_address, fromBlock: `0x${demo.deploy_block.toString(16)}`,
         toBlock: 'latest', topics: [NOTE_DEPOSITED_TOPIC] }]);
     claimableNotes = [];
