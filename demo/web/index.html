@@ -7,151 +7,228 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header>
-    <h1>Private Search</h1>
-    <p class="sub">Each search is paid with a zero-knowledge proof. The operator is paid, but can't tell who searched, or which searches came from the same person.</p>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">◈</span>
+        <div>
+          <div class="brand-name">Private Search</div>
+          <div class="brand-sub">paid with zero-knowledge proofs</div>
+        </div>
+      </div>
+      <div class="status">
+        <div class="chip" id="hdr-server" title="zkapi serverd"><span class="dot"></span><span>server</span></div>
+        <div class="chip" id="hdr-account">not connected</div>
+        <div class="chip strong" id="hdr-balance" title="Private balance across your open notes">—</div>
+      </div>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="search" class="active">Search</button>
+      <button role="tab" data-tab="notes">Notes <span class="count" id="tab-notes-count"></span></button>
+      <button role="tab" data-tab="withdraw">Withdraw</button>
+      <button role="tab" data-tab="operator">Operator</button>
+      <button role="tab" data-tab="explorer">Explorer</button>
+      <button role="tab" data-tab="activity">Activity</button>
+    </nav>
   </header>
 
+  <div class="busy" id="busy" hidden>
+    <span class="spinner" aria-hidden="true"></span>
+    <span id="busy-text">Working…</span>
+  </div>
+
   <main>
-    <section class="card" id="wallet-card">
-      <h2>1 · Wallet</h2>
-      <div class="row">
-        <label for="wallet-mode">Pay deposits from</label>
-        <select id="wallet-mode">
-          <option value="anvil">Anvil test account (no extension needed)</option>
-          <option value="injected">Browser wallet (MetaMask on Anvil)</option>
-        </select>
-        <button id="connect">Connect</button>
-      </div>
-      <div class="row spaced" id="account-row">
-        <label for="account-select">Account</label>
-        <select id="account-select"></select>
-      </div>
-      <p class="muted" id="account">Not connected</p>
-    </section>
-
-    <section class="card" id="deposit-card">
-      <h2>2 · Deposit</h2>
-      <p class="muted">Each deposit creates a new, separate private note. Only this browser holds its secret.</p>
-      <div class="row">
-        <input id="deposit-eth" type="number" min="0.001" step="0.001" value="0.01" aria-label="Deposit in ETH">
-        <span>ETH</span>
-        <button id="deposit" disabled>Deposit</button>
-      </div>
-    </section>
-
-    <section class="card" id="balance-card">
-      <h2>My notes</h2>
-      <div class="balance"><span id="balance">—</span></div>
-      <p class="muted" id="note-info">No notes yet</p>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Note</th><th class="num">Deposited</th><th class="num">Balance</th><th class="num">Searches</th><th>Expires</th><th>Status</th><th></th></tr></thead>
-          <tbody id="my-notes"></tbody>
-        </table>
-      </div>
-      <p class="muted" id="price"></p>
-    </section>
-
-    <section class="card" id="search-card">
-      <h2>3 · Search</h2>
-      <div class="row">
-        <label for="pay-with">Pay with</label>
-        <select id="pay-with"></select>
-      </div>
-      <form id="search-form" class="row spaced">
-        <input id="query" type="search" placeholder="e.g. nullifier merkle" autocomplete="off" aria-label="Search query">
-        <button id="search" type="submit" disabled>Search</button>
-      </form>
-      <button id="retry" class="secondary" hidden>Resend the pending search</button>
-      <ol id="results"></ol>
-    </section>
-
-    <section class="card" id="withdraw-card">
-      <h2>4 · Withdraw</h2>
-      <p class="muted">Take the remaining balance out of the vault. The operator receives what you spent.</p>
-      <div class="row">
-        <label for="withdraw-note">Note</label>
-        <select id="withdraw-note"></select>
-      </div>
-      <div class="row spaced">
-        <label for="destination">Pay to</label>
-        <input id="destination" class="address" placeholder="0x… (defaults to the connected account)" autocomplete="off">
-      </div>
-      <div class="options">
-        <div class="option">
-          <button id="mutual">Mutual close</button>
-          <p class="muted">Normal exit. The operator co-signs your final balance; paid in one transaction, no waiting.</p>
+    <!-- ============================================================ search -->
+    <section class="panel active" data-panel="search">
+      <div class="grid">
+        <div class="col-main">
+          <div class="card hero">
+            <h1>Search without being tracked</h1>
+            <p class="lead">Each search is paid from a private note with a proof made in your browser. The operator is paid, but can't tell who searched, or which searches came from the same person.</p>
+            <form id="search-form" class="searchbar">
+              <input id="query" type="search" placeholder="Try “nullifier merkle” or “pedersen blinding”" autocomplete="off" aria-label="Search query">
+              <button id="search" type="submit" disabled>Search</button>
+            </form>
+            <div class="row small">
+              <label for="pay-with">Pay with</label>
+              <select id="pay-with"></select>
+              <span class="muted" id="price"></span>
+            </div>
+            <button id="retry" class="link" hidden>Resend the pending search</button>
+          </div>
+          <div id="receipt" class="receipt" hidden></div>
+          <ol id="results" class="results"></ol>
         </div>
-        <div class="option">
-          <button id="escape" class="secondary-solid">Escape</button>
-          <p class="muted">Exit without the operator (if it is offline or refuses). Paid after the challenge period, during which the operator can contest a stale state.</p>
+
+        <aside class="col-side">
+          <div class="card">
+            <h2><span class="step">1</span>Wallet</h2>
+            <label class="field">Pay deposits from
+              <select id="wallet-mode">
+                <option value="anvil">Anvil test account (no extension)</option>
+                <option value="injected">Browser wallet (MetaMask on Anvil)</option>
+              </select>
+            </label>
+            <label class="field" id="account-row">Account
+              <select id="account-select"></select>
+            </label>
+            <button id="connect" class="block">Connect</button>
+            <p class="muted small mono" id="account">Not connected</p>
+          </div>
+
+          <div class="card">
+            <h2><span class="step">2</span>Deposit</h2>
+            <p class="muted small">Each deposit is a new private note. Only this browser holds its secret.</p>
+            <div class="presets" id="presets">
+              <button type="button" class="preset" data-eth="0.01">0.01</button>
+              <button type="button" class="preset" data-eth="0.05">0.05</button>
+              <button type="button" class="preset" data-eth="0.1">0.1</button>
+              <button type="button" class="preset" data-eth="1">1</button>
+            </div>
+            <div class="row">
+              <div class="amount">
+                <input id="deposit-eth" type="number" min="0.001" step="0.001" value="0.01" aria-label="Deposit in ETH">
+                <span>ETH</span>
+              </div>
+              <button id="deposit" disabled>Deposit</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Private balance</h2>
+            <div class="balance" id="balance">—</div>
+            <p class="muted small" id="note-info">Connect an account to see its notes.</p>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ============================================================ notes -->
+    <section class="panel" data-panel="notes">
+      <div class="card">
+        <div class="card-head">
+          <h2>My notes</h2>
+          <button id="reset" class="ghost danger small-btn">Forget this account's notes</button>
+        </div>
+        <p class="muted small">Every note is separate: spending from one never links it to another. A note pays a search only while its balance covers one and it has not expired.</p>
+        <div class="table-wrap">
+          <table class="notes-table">
+            <thead><tr><th>Note</th><th class="num">Deposited</th><th class="num">Balance</th><th>Used</th><th class="num">Searches</th><th>Expires</th><th>Status</th><th></th></tr></thead>
+            <tbody id="my-notes"></tbody>
+          </table>
         </div>
       </div>
-      <p class="muted" id="exit-result"></p>
     </section>
 
-    <section class="card" id="operator-card">
-      <h2>Operator view</h2>
-      <p class="muted">What the vault owner sees and can do. Anyone can trigger these calls; the money always goes to the treasury.</p>
-      <h3>Accounts</h3>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Role</th><th>Address</th><th class="num">Balance</th></tr></thead>
-          <tbody id="accounts"></tbody>
-        </table>
-      </div>
-
-      <h3>Operator revenue</h3>
-      <dl class="stats">
-        <div><dt>Searches served</dt><dd id="served">—</dd></div>
-        <div><dt>Charged (signed into balances)</dt><dd id="charged">—</dd></div>
-        <div><dt>Received by the treasury</dt><dd id="received">—</dd></div>
-        <div><dt>Still in the vault</dt><dd id="vault-balance">—</dd></div>
-      </dl>
-      <p class="muted">Charges move to the treasury only when a note closes (its spent part) or expires (all of it).</p>
-
-      <h3>Vault parameters</h3>
-      <dl class="stats" id="params"></dl>
-
-      <h3>What the operator sees</h3>
-      <p class="muted">The server's own record of served searches: queries, nullifiers and charges. No address, no note, nothing linking two searches.</p>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Time</th><th>Query</th><th>Nullifier</th><th class="num">Charge</th></tr></thead>
-          <tbody id="seen"></tbody>
-        </table>
-      </div>
-
-      <h3>Notes</h3>
-      <div class="row">
-        <button id="skip-hour" class="secondary-solid">Skip chain time +1 h</button>
-        <button id="skip-expiry" class="secondary-solid">Skip past the next expiry</button>
-        <button id="refresh-notes" class="secondary-solid">Refresh</button>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Note</th><th>Deposit</th><th>Status</th><th>Claimable from</th><th></th></tr></thead>
-          <tbody id="notes"></tbody>
-        </table>
+    <!-- ============================================================ withdraw -->
+    <section class="panel" data-panel="withdraw">
+      <div class="card">
+        <h2>Withdraw a note</h2>
+        <p class="muted small">Take a note's remaining balance out of the vault, to any address. The operator receives what the note spent.</p>
+        <div class="form-grid">
+          <label class="field">Note
+            <select id="withdraw-note"></select>
+          </label>
+          <label class="field">Pay to
+            <input id="destination" class="mono" placeholder="0x… (defaults to the connected account)" autocomplete="off">
+          </label>
+        </div>
+        <div class="options">
+          <div class="option">
+            <h3>Mutual close</h3>
+            <p class="muted small">The normal exit. The operator co-signs your final balance and one transaction pays you. No waiting.</p>
+            <button id="mutual" class="block">Mutual close</button>
+          </div>
+          <div class="option">
+            <h3>Escape</h3>
+            <p class="muted small">Exit without the operator, if it is offline or refuses. Paid after the challenge period, during which the operator can contest a stale state. Finalize it from the Notes tab.</p>
+            <button id="escape" class="block ghost">Escape</button>
+          </div>
+        </div>
+        <p class="result" id="exit-result"></p>
       </div>
     </section>
 
-    <section class="card" id="explorer-card">
-      <h2>Chain explorer</h2>
-      <p class="muted">Every transaction that touched the vault, read straight from Anvil, with each involved address's balance before and after its block. The sender's change includes gas.</p>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Block</th><th>Time</th><th>Action</th><th>Tx</th><th>Balance changes</th></tr></thead>
-          <tbody id="txs"></tbody>
-        </table>
+    <!-- ============================================================ operator -->
+    <section class="panel" data-panel="operator" id="operator-card">
+      <div class="card">
+        <div class="card-head">
+          <h2>Operator revenue</h2>
+          <button id="refresh-notes" class="ghost small-btn">Refresh</button>
+        </div>
+        <dl class="stats">
+          <div><dt>Searches served</dt><dd id="served">—</dd></div>
+          <div><dt>Charged into balances</dt><dd id="charged">—</dd></div>
+          <div><dt>Received by the treasury</dt><dd id="received">—</dd></div>
+          <div><dt>Still in the vault</dt><dd id="vault-balance">—</dd></div>
+        </dl>
+        <p class="muted small">Charges reach the treasury only when a note closes (its spent part) or expires (all of it).</p>
+      </div>
+
+      <div class="card">
+        <h2>Accounts</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Role</th><th>Address</th><th class="num">Balance</th></tr></thead>
+            <tbody id="accounts"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>What the operator sees</h2>
+        <p class="muted small">The server's own record of served searches: queries, nullifiers and charges. No address, no note, nothing linking two searches.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>Query</th><th>Nullifier</th><th class="num">Charge</th></tr></thead>
+            <tbody id="seen"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>All notes in the vault</h2>
+          <div class="row">
+            <button id="skip-hour" class="ghost small-btn">Skip chain time +1 h</button>
+            <button id="skip-expiry" class="ghost small-btn">Skip past the next expiry</button>
+          </div>
+        </div>
+        <p class="muted small">Anyone may sweep an expired note; its whole deposit goes to the treasury.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Note</th><th class="num">Deposit</th><th>Status</th><th>Claimable from</th><th></th></tr></thead>
+            <tbody id="notes"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Vault parameters</h2>
+        <dl class="stats" id="params"></dl>
       </div>
     </section>
 
-    <section class="card">
-      <h2>Activity</h2>
-      <ol id="log" class="log"></ol>
-      <button id="reset" class="secondary danger">Forget this account's notes</button>
+    <!-- ============================================================ explorer -->
+    <section class="panel" data-panel="explorer" id="explorer-card">
+      <div class="card">
+        <h2>Chain explorer</h2>
+        <p class="muted small">Every transaction that touched the vault, read straight from Anvil, with each involved address's balance before and after its block. Searches never appear here: they never touch the chain. The sender's change includes gas.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Block</th><th>Time</th><th>Action</th><th>Tx</th><th>Balance changes</th></tr></thead>
+            <tbody id="txs"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ activity -->
+    <section class="panel" data-panel="activity">
+      <div class="card">
+        <h2>Activity</h2>
+        <ol id="log" class="log"></ol>
+      </div>
     </section>
   </main>
 

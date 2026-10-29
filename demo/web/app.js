@@ -39,6 +39,7 @@ const prover = (call, args) => new Promise((resolve, reject) => {
 
 // ------------------------------------------------------------------ helpers
 function log(message, kind = '') {
+    if (busyDepth > 0 && kind !== 'err') $('busy-text').textContent = message;
     const item = document.createElement('li');
     item.textContent = `${new Date().toLocaleTimeString()}  ${message}`;
     if (kind) item.className = kind;
@@ -68,6 +69,8 @@ const nowSeconds = () => Math.floor(Date.now() / 1000);
 const ethCall = (to, data) => rpc('eth_call', [{ to, data }, 'latest']);
 const chainNow = async () => Number(BigInt((await rpc('eth_getBlockByNumber', ['latest', false])).timestamp));
 let chainOffset = 0; // chain time minus wall time, refreshed by the operator view
+let busyDepth = 0;   // actions in flight; the banner shows the latest step
+let lastProofSeconds = null;
 
 // Wallet storage: { notes: { [noteId]: { state, pending, exit } } }. A note's
 // `state` is the prover's BrowserNoteState, `pending` a prepared request not
@@ -152,6 +155,9 @@ function render() {
     const open = notes.filter(isOpen);
     const total = open.reduce((sum, note) => sum + BigInt(note.state.current_balance), 0n);
     $('balance').textContent = notes.length ? eth(total) : '—';
+    $('hdr-balance').textContent = account ? `${eth(total)} private` : '—';
+    $('hdr-account').textContent = account ? `${addressLabel(account)} · ${account.slice(0, 6)}…${account.slice(-4)}` : 'not connected';
+    $('tab-notes-count').textContent = open.length ? String(open.length) : '';
     $('note-info').textContent = !account ? 'Connect an account to see its notes.' : notes.length
         ? `Private balance across ${open.length} open note${open.length === 1 ? '' : 's'} of ${account.slice(0, 8)}… · ${notes.length - open.length} closed`
         : `No notes for ${account.slice(0, 8)}… yet: deposit to create one.`;
@@ -160,8 +166,24 @@ function render() {
     $('my-notes').replaceChildren(...notes.slice().reverse().map(note => {
         const [kind, label] = statusOf(note);
         const id = note.state.note_id;
-        const row = cellRow([`#${id}`, eth(note.state.deposit_amount), note.exit?.done ? `paid out ${eth(note.exit.paid)}` : eth(note.state.current_balance),
-            String(searchesOf(note)), new Date(note.state.expiry_ts * 1000).toLocaleString()], ['', 'num', 'num', 'num', '']);
+        const row = cellRow([`#${id}`, eth(note.state.deposit_amount), note.exit?.done ? `paid out ${eth(note.exit.paid)}` : eth(note.state.current_balance)],
+            ['', 'num', 'num']);
+        const used = document.createElement('td');
+        const bar = document.createElement('div');
+        bar.className = 'bar';
+        bar.title = 'share of the deposit spent on searches';
+        const fill = document.createElement('span');
+        const spent = BigInt(note.state.deposit_amount) - BigInt(note.state.current_balance);
+        fill.style.width = `${Math.min(100, Number(spent * 10_000n / BigInt(note.state.deposit_amount)) / 100)}%`;
+        bar.append(fill);
+        used.append(bar);
+        row.append(used);
+        for (const [text, cls] of [[String(searchesOf(note)), 'num'], [new Date(note.state.expiry_ts * 1000).toLocaleString(), '']]) {
+            const cell = document.createElement('td');
+            cell.textContent = text;
+            if (cls) cell.className = cls;
+            row.append(cell);
+        }
         if (kind === 'closed' || kind === 'claimed') row.className = 'closed';
         const status = document.createElement('td');
         const pill = document.createElement('span');
@@ -232,6 +254,7 @@ async function useAccount(address, how) {
     const balance = BigInt(await rpc('eth_getBalance', [account, 'latest']));
     $('account').textContent = `${account} · ${(Number(balance / GWEI) / 1e9).toFixed(3)} ETH on chain · ${how}`;
     $('results').replaceChildren();
+    $('receipt').hidden = true;
     $('exit-result').textContent = '';
     log(`using ${account} (${myNotes().length} note${myNotes().length === 1 ? '' : 's'} in this browser)`, 'ok');
     render();
@@ -331,7 +354,8 @@ async function search(query) {
             created_at_ms: Date.now(),
         }),
     }));
-    log(`proof ready in ${((performance.now() - started) / 1000).toFixed(1)} s; nullifier ${prepared.request.public_inputs.request_nullifier.slice(0, 18)}…`);
+    lastProofSeconds = ((performance.now() - started) / 1000).toFixed(1);
+    log(`proof ready in ${lastProofSeconds} s; nullifier ${prepared.request.public_inputs.request_nullifier.slice(0, 18)}…`);
     // Commit the prepared state and the request before it leaves the browser,
     // so a lost response can be fetched again by resending it.
     updateNote(noteId, { state: prepared.state, pending: { request: prepared.request, journal: prepared.journal } });
@@ -355,6 +379,16 @@ async function send(noteId = myNotes().find(note => note.pending && isOpen(note)
     });
     updateNote(noteId, { state: JSON.parse(next), pending: null });
     log(`note #${noteId} paid ${eth(body.charge_applied)}; the server's signature on its new balance verified`, 'ok');
+    const receipt = $('receipt');
+    receipt.removeAttribute('style');
+    receipt.hidden = false;
+    receipt.replaceChildren(...[
+        `✓ Paid ${eth(body.charge_applied)} from note #${noteId}`,
+        `new balance ${eth(JSON.parse(next).current_balance)}`,
+        lastProofSeconds ? `proof ${lastProofSeconds} s` : null,
+        `nullifier ${body.request_nullifier.slice(0, 10)}…`,
+        'server signature verified',
+    ].filter(Boolean).map(text => Object.assign(document.createElement('span'), { textContent: text })));
     showResults(JSON.parse(body.response_payload));
 }
 
@@ -362,7 +396,7 @@ function showResults(result) {
     const list = $('results');
     list.replaceChildren();
     if (!result.results?.length) {
-        list.textContent = `No results for "${result.query}".`;
+        list.append(Object.assign(document.createElement('li'), { className: 'empty', textContent: `No results for “${result.query}”.` }));
         return;
     }
     for (const hit of result.results) {
@@ -551,7 +585,20 @@ function renderParams(now) {
     }));
 }
 
+async function refreshHealth() {
+    const chip = $('hdr-server');
+    try {
+        const health = await getJSON('/api/server/health');
+        chip.className = `chip ${health.status === 'ok' ? 'ok' : 'bad'}`;
+        chip.lastElementChild.textContent = `server ${health.status} · root ${health.vault_root_age_seconds ?? '?'} s old`;
+    } catch {
+        chip.className = 'chip bad';
+        chip.lastElementChild.textContent = 'server unreachable';
+    }
+}
+
 async function refreshOperator() {
+    refreshHealth();
     const now = await chainNow();
     chainOffset = now - nowSeconds();
     renderParams(now);
@@ -658,7 +705,8 @@ async function exploreTx(hash) {
         const delta = document.createElement('span');
         delta.className = change.delta > 0n ? 'plus' : 'minus';
         // Gas alone is far below 0.0001 ETH: show small changes in gwei.
-        delta.textContent = amount < 100_000n * GWEI ? `${sign}${(Number(amount) / 1e9).toFixed(0)} gwei` : `${sign}${ethWei(amount)}`;
+        delta.textContent = amount < GWEI ? `${sign}<1 gwei (gas)`
+            : amount < 100_000n * GWEI ? `${sign}${(Number(amount) / 1e9).toFixed(0)} gwei` : `${sign}${ethWei(amount)}`;
         line.append(`${addressLabel(change.address)}: ${ethWei(change.before)} → ${ethWei(change.after)} `, delta);
         cell.append(line);
     }
@@ -687,16 +735,36 @@ function guarded(button, action) {
     return async event => {
         event?.preventDefault();
         button.disabled = true;
+        busyDepth++;
+        $('busy-text').textContent = `${button.textContent.trim() || 'Working'}…`;
+        $('busy').hidden = false;
         try {
             await action();
         } catch (error) {
             log(error.message, 'err');
+            showError(error.message);
         } finally {
+            busyDepth--;
+            if (busyDepth === 0) $('busy').hidden = true;
             // render() re-disables the buttons whose state it manages.
             button.disabled = false;
             render();
         }
     };
+}
+
+/** A failed action, shown where the user is looking (the Activity tab keeps the log). */
+function showError(message) {
+    const receipt = $('receipt');
+    receipt.hidden = false;
+    receipt.style.background = 'var(--err-soft)';
+    receipt.style.color = 'var(--err)';
+    receipt.textContent = message;
+}
+
+function showTab(name) {
+    for (const button of document.querySelectorAll('.tabs button')) button.classList.toggle('active', button.dataset.tab === name);
+    for (const panel of document.querySelectorAll('.panel')) panel.classList.toggle('active', panel.dataset.panel === name);
 }
 
 async function main() {
@@ -712,6 +780,14 @@ async function main() {
         state_signing_key: demo.state_signing_key,
         clearance_signing_key: demo.clearance_signing_key,
     };
+    for (const button of document.querySelectorAll('.tabs button')) button.onclick = () => showTab(button.dataset.tab);
+    for (const preset of document.querySelectorAll('.preset')) {
+        preset.onclick = () => {
+            $('deposit-eth').value = preset.dataset.eth;
+            for (const other of document.querySelectorAll('.preset')) other.classList.toggle('selected', other === preset);
+        };
+    }
+    $('deposit-eth').oninput = () => document.querySelectorAll('.preset').forEach(preset => preset.classList.remove('selected'));
     $('connect').onclick = guarded($('connect'), connect);
     $('account-select').onchange = guarded($('account-select'), connect);
     $('wallet-mode').onchange = () => { $('account-row').hidden = $('wallet-mode').value !== 'anvil'; };
