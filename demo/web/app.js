@@ -1,5 +1,6 @@
-// The private-search demo page: deposit into the vault, then pay for each
-// search with a request proof made in this browser (worker.js). The note's
+// The private-search demo page: deposit into the vault (each deposit is its
+// own note), then pay for each search with a request proof made in this
+// browser (worker.js) from the note chosen under "Pay with". Every note's
 // secret and state stay in this browser's localStorage.
 //
 // Flow of one search:
@@ -68,12 +69,19 @@ const ethCall = (to, data) => rpc('eth_call', [{ to, data }, 'latest']);
 const chainNow = async () => Number(BigInt((await rpc('eth_getBlockByNumber', ['latest', false])).timestamp));
 let chainOffset = 0; // chain time minus wall time, refreshed by the operator view
 
+// Wallet storage: { notes: { [noteId]: { state, pending, exit } } }. A note's
+// `state` is the prover's BrowserNoteState, `pending` a prepared request not
+// yet answered, `exit` its withdrawal. The single-note layout of earlier
+// builds ({ state, pending, exit }) is migrated on load.
 function load() {
+    let wallet;
     try {
-        return JSON.parse(localStorage.getItem(storageKey) ?? 'null');
+        wallet = JSON.parse(localStorage.getItem(storageKey) ?? 'null');
     } catch {
-        return null;
+        wallet = null;
     }
+    if (wallet?.state) wallet = { notes: { [wallet.state.note_id]: { state: wallet.state, pending: wallet.pending, exit: wallet.exit } } };
+    return wallet?.notes ? wallet : { notes: {} };
 }
 
 function save(wallet) {
@@ -81,38 +89,122 @@ function save(wallet) {
     render();
 }
 
-function render() {
+function updateNote(noteId, patch) {
     const wallet = load();
-    const state = wallet?.state;
-    $('balance').textContent = state ? eth(state.current_balance) : '—';
-    $('note-info').textContent = state
-        ? `Note #${state.note_id} · deposited ${eth(state.deposit_amount)} · ${state.is_genesis ? 'unspent' : 'spent from'}`
-        : 'No note yet';
-    $('price').textContent = `Each search costs ${eth(demo.price_units)}; a search needs a balance of at least ${eth(demo.request_charge_cap)}.`;
-    const exit = wallet?.exit;
-    $('deposit').disabled = !account || (Boolean(state) && !exit?.done);
-    $('search').disabled = !state || Boolean(wallet?.pending) || Boolean(exit);
-    $('retry').hidden = !wallet?.pending;
-    const canExit = Boolean(account && state && !wallet?.pending && !exit);
-    $('mutual').disabled = !canExit;
-    $('escape').disabled = !canExit;
-    $('escape-status').hidden = !(exit?.mode === 'escape' && !exit.done);
-    $('exit-result').textContent = exit?.done
-        ? `Note #${state.note_id} closed by ${exit.mode === 'mutual' ? 'mutual close' : 'escape'}: you received ${eth(exit.paid)}, `
-          + `the operator ${eth(BigInt(state.deposit_amount) - BigInt(exit.paid))}. Deposit again to start a new note.`
-        : '';
-    if (exit?.done) $('note-info').textContent = `Note #${state.note_id} · closed`;
-    tickEscape();
+    wallet.notes[noteId] = { ...wallet.notes[noteId], ...patch };
+    save(wallet);
 }
 
-function tickEscape() {
-    const exit = load()?.exit;
-    if (exit?.mode !== 'escape' || exit.done) return;
-    const left = exit.deadline - (nowSeconds() + chainOffset);
-    $('escape-text').textContent = left > 0
-        ? `Escape pending: ${eth(exit.paid)} to ${exit.destination}. Finalizable in ${left} s (chain time); the operator can contest it until then.`
-        : `The challenge period is over: finalize to receive ${eth(exit.paid)}.`;
-    $('finalize').disabled = left > 0 || !account;
+const myNotes = () => Object.values(load().notes).sort((a, b) => a.state.note_id - b.state.note_id);
+// The vault's status of each note, from the operator view's refresh (1 active,
+// 2 escaping, 3 closed); a closed note this browser did not exit was swept.
+const chainStatus = new Map();
+const isOpen = note => !note.exit && chainStatus.get(note.state.note_id) !== 3;
+// A request proves expiry >= request time, so an expired note can only withdraw.
+const canPay = note => isOpen(note) && !note.pending && note.state.expiry_ts > nowSeconds()
+    && BigInt(note.state.current_balance) >= BigInt(demo.request_charge_cap);
+const searchesOf = note => Number((BigInt(note.state.deposit_amount) - BigInt(note.state.current_balance)) / BigInt(demo.price_units));
+
+function statusOf(note) {
+    if (note.exit?.mode === 'escape' && !note.exit.done) return ['escaping', 'escaping'];
+    if (note.exit?.done) return ['closed', `closed (${note.exit.mode === 'mutual' ? 'mutual close' : 'escape'})`];
+    if (chainStatus.get(note.state.note_id) === 3) return ['claimed', 'expired, swept to treasury'];
+    if (note.state.expiry_ts <= nowSeconds() + chainOffset) return ['expired', 'expired: withdraw now'];
+    if (note.pending) return ['active', 'search pending'];
+    if (!canPay(note)) return ['active', 'balance below one search'];
+    return ['active', 'active'];
+}
+
+/** The note that pays the next search: the chosen one, or the open note with the least balance that covers it. */
+function payer() {
+    const choice = $('pay-with').value;
+    const notes = myNotes();
+    if (choice !== 'auto') {
+        const note = notes.find(entry => String(entry.state.note_id) === choice);
+        if (!note || !canPay(note)) throw new Error(`Note #${choice} cannot pay for a search now.`);
+        return note;
+    }
+    const usable = notes.filter(canPay).sort((a, b) => Number(BigInt(a.state.current_balance) - BigInt(b.state.current_balance)));
+    if (!usable.length) throw new Error('No note can pay for a search: deposit a new note.');
+    return usable[0];
+}
+
+function fillSelect(select, options) {
+    const previous = select.value;
+    select.replaceChildren(...options.map(([value, label]) => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        return option;
+    }));
+    if (options.some(([value]) => value === previous)) select.value = previous;
+}
+
+function render() {
+    const notes = myNotes();
+    const open = notes.filter(isOpen);
+    const total = open.reduce((sum, note) => sum + BigInt(note.state.current_balance), 0n);
+    $('balance').textContent = notes.length ? eth(total) : '—';
+    $('note-info').textContent = notes.length
+        ? `Private balance across ${open.length} open note${open.length === 1 ? '' : 's'} · ${notes.length - open.length} closed`
+        : 'No notes yet: deposit to create one.';
+    $('price').textContent = `Each search costs ${eth(demo.price_units)}; the paying note needs at least ${eth(demo.request_charge_cap)}.`;
+
+    $('my-notes').replaceChildren(...notes.slice().reverse().map(note => {
+        const [kind, label] = statusOf(note);
+        const id = note.state.note_id;
+        const row = cellRow([`#${id}`, eth(note.state.deposit_amount), note.exit?.done ? `paid out ${eth(note.exit.paid)}` : eth(note.state.current_balance),
+            String(searchesOf(note)), new Date(note.state.expiry_ts * 1000).toLocaleString()], ['', 'num', 'num', 'num', '']);
+        if (kind === 'closed' || kind === 'claimed') row.className = 'closed';
+        const status = document.createElement('td');
+        const pill = document.createElement('span');
+        pill.className = `pill ${kind}`;
+        pill.textContent = label;
+        status.append(pill);
+        if (kind === 'escaping') {
+            const countdown = document.createElement('span');
+            countdown.className = 'muted countdown';
+            countdown.dataset.deadline = note.exit.deadline;
+            status.append(' ', countdown);
+        }
+        const action = document.createElement('td');
+        if (kind === 'escaping') {
+            const button = document.createElement('button');
+            button.textContent = 'Finalize';
+            button.className = 'finalize';
+            button.dataset.deadline = note.exit.deadline;
+            button.onclick = guarded(button, () => finalizeEscape(id));
+            action.append(button);
+        }
+        row.append(status, action);
+        return row;
+    }));
+
+    fillSelect($('pay-with'), [['auto', 'Auto (an open note with enough balance)'],
+        ...notes.filter(canPay).map(note => [String(note.state.note_id), `Note #${note.state.note_id} · ${eth(note.state.current_balance)}`])]);
+    fillSelect($('withdraw-note'), notes.filter(note => isOpen(note) && !note.pending)
+        .map(note => [String(note.state.note_id), `Note #${note.state.note_id} · ${eth(note.state.current_balance)}`]));
+
+    const pendingNote = notes.find(note => note.pending && isOpen(note));
+    $('deposit').disabled = !account;
+    $('search').disabled = !notes.some(canPay) || Boolean(pendingNote);
+    $('retry').hidden = !pendingNote;
+    const canExit = Boolean(account && $('withdraw-note').value);
+    $('mutual').disabled = !canExit;
+    $('escape').disabled = !canExit;
+    tick();
+}
+
+/** Once a second: escape countdowns and Finalize buttons. */
+function tick() {
+    const now = nowSeconds() + chainOffset;
+    for (const element of document.querySelectorAll('.countdown')) {
+        const left = Number(element.dataset.deadline) - now;
+        element.textContent = left > 0 ? `finalizable in ${left} s` : 'ready to finalize';
+    }
+    for (const button of document.querySelectorAll('button.finalize')) {
+        button.disabled = !account || Number(button.dataset.deadline) > now;
+    }
 }
 
 // ------------------------------------------------------------------ wallet
@@ -174,8 +266,8 @@ async function deposit() {
         config: JSON.stringify(walletConfig),
         args: JSON.stringify({ secret: params.secret, note_id: noteId, amount, expiry_ts: expiryTs }),
     });
-    save({ state: JSON.parse(state), pending: null });
-    log(`note #${noteId} deposited: ${eth(amount)}`, 'ok');
+    updateNote(noteId, { state: JSON.parse(state), pending: null, exit: null });
+    log(`note #${noteId} created: ${eth(amount)}`, 'ok');
 }
 
 // ------------------------------------------------------------------ search
@@ -191,17 +283,15 @@ async function admittedSnapshot(noteId) {
 }
 
 async function search(query) {
-    const wallet = load();
-    if (BigInt(wallet.state.current_balance) < BigInt(demo.request_charge_cap)) {
-        throw new Error('The balance is below the per-request bound; deposit a new note.');
-    }
+    const note = payer();
+    const noteId = note.state.note_id;
     const started = performance.now();
-    const snapshot = await admittedSnapshot(wallet.state.note_id);
-    const path = JSON.parse(await prover('treePath', { snapshot: JSON.stringify(snapshot), noteId: wallet.state.note_id }));
-    log(`proving membership in a tree of ${snapshot.next_note_id} notes…`);
+    const snapshot = await admittedSnapshot(noteId);
+    const path = JSON.parse(await prover('treePath', { snapshot: JSON.stringify(snapshot), noteId }));
+    log(`note #${noteId} pays; proving membership in a tree of ${snapshot.next_note_id} notes…`);
     const prepared = JSON.parse(await prover('prepareRequest', {
         config: JSON.stringify(walletConfig),
-        state: JSON.stringify(wallet.state),
+        state: JSON.stringify(note.state),
         args: JSON.stringify({
             payload: JSON.stringify({ query, limit: 5 }),
             active_root: path.active_root,
@@ -214,27 +304,27 @@ async function search(query) {
     log(`proof ready in ${((performance.now() - started) / 1000).toFixed(1)} s; nullifier ${prepared.request.public_inputs.request_nullifier.slice(0, 18)}…`);
     // Commit the prepared state and the request before it leaves the browser,
     // so a lost response can be fetched again by resending it.
-    save({ state: prepared.state, pending: { request: prepared.request, journal: prepared.journal } });
-    await send();
+    updateNote(noteId, { state: prepared.state, pending: { request: prepared.request, journal: prepared.journal } });
+    await send(noteId);
 }
 
-async function send() {
-    const wallet = load();
-    const { request, journal } = wallet.pending;
+/** Send (or resend) a note's pending request and install the signed successor. */
+async function send(noteId = myNotes().find(note => note.pending && isOpen(note))?.state.note_id) {
+    const note = load().notes[noteId];
+    const { request, journal } = note.pending;
     const response = await fetch('/api/server/v2/requests', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request),
     });
     const body = await response.json();
     if (!response.ok) {
-        const retriable = body.retriable;
-        throw new Error(`${body.error_code}: ${body.error_message}${retriable ? ' (press "Resend")' : ''}`);
+        throw new Error(`${body.error_code}: ${body.error_message}${body.retriable ? ' (press "Resend")' : ''}`);
     }
     const next = await prover('completeResponse', {
         config: JSON.stringify(walletConfig),
-        args: JSON.stringify({ state: wallet.state, journal, response: body }),
+        args: JSON.stringify({ state: note.state, journal, response: body }),
     });
-    save({ state: JSON.parse(next), pending: null });
-    log(`paid ${eth(body.charge_applied)}; the server's signature on the new balance verified`, 'ok');
+    updateNote(noteId, { state: JSON.parse(next), pending: null });
+    log(`note #${noteId} paid ${eth(body.charge_applied)}; the server's signature on its new balance verified`, 'ok');
     showResults(JSON.parse(body.response_payload));
 }
 
@@ -278,12 +368,19 @@ async function exitValidUntil() {
     return Math.max(nowSeconds(), await chainNow()) + 900;
 }
 
+function withdrawNote() {
+    const note = load().notes[$('withdraw-note').value];
+    if (!note || !isOpen(note) || note.pending) throw new Error('Choose an open note to withdraw.');
+    return note;
+}
+
 async function mutualClose() {
-    const wallet = load();
+    const note = withdrawNote();
+    const noteId = note.state.note_id;
     const to = destination();
     const config = JSON.stringify(walletConfig);
-    const state = JSON.stringify(wallet.state);
-    log('proving note ownership for the operator\'s clearance…');
+    const state = JSON.stringify(note.state);
+    log(`note #${noteId}: proving ownership for the operator's clearance…`);
     const ownership = JSON.parse(await prover('prepareWithdrawal', {
         config, state, args: JSON.stringify({ mode: 'ownership', valid_until: nowSeconds() + 600 }),
     }));
@@ -296,42 +393,46 @@ async function mutualClose() {
     });
     const clearance = await response.json();
     if (!response.ok) throw new Error(`${clearance.error_code}: ${clearance.error_message}`);
-    log('the operator signed the clearance for this balance', 'ok');
+    log(`note #${noteId}: the operator signed the clearance for its balance`, 'ok');
     const plan = JSON.parse(await prover('prepareWithdrawal', {
         config, state, args: JSON.stringify({ mode: 'mutual', destination: to, valid_until: await exitValidUntil(), clearance }),
     }));
     const data = encodeWithdrawal(plan, 'mutual', to, demo.contract_address);
     const hash = await sendAndWait({ from: account, to: demo.contract_address, data, gas: '0x2dc6c0' }, 'mutual close');
     const paid = String(BigInt(plan.public_inputs.final_balance));
-    save({ ...wallet, exit: { mode: 'mutual', done: true, tx: hash, paid, destination: to } });
-    log(`closed: ${eth(paid)} paid to ${to}`, 'ok');
+    updateNote(noteId, { exit: { mode: 'mutual', done: true, tx: hash, paid, destination: to } });
+    $('exit-result').textContent = `Note #${noteId} closed: you received ${eth(paid)}, `
+        + `the operator ${eth(BigInt(note.state.deposit_amount) - BigInt(paid))}.`;
+    log(`note #${noteId} closed: ${eth(paid)} paid to ${to}`, 'ok');
     await refreshOperator();
 }
 
 async function escape() {
-    const wallet = load();
+    const note = withdrawNote();
+    const noteId = note.state.note_id;
     const to = destination();
-    log('proving the latest signed balance for an escape (no operator involved)…');
+    log(`note #${noteId}: proving its latest signed balance for an escape (no operator involved)…`);
     const plan = JSON.parse(await prover('prepareWithdrawal', {
-        config: JSON.stringify(walletConfig), state: JSON.stringify(wallet.state),
+        config: JSON.stringify(walletConfig), state: JSON.stringify(note.state),
         args: JSON.stringify({ mode: 'escape', destination: to, conceded: 0, valid_until: await exitValidUntil() }),
     }));
     const data = encodeWithdrawal(plan, 'escape', to, demo.contract_address, { conceded: 0 });
     const hash = await sendAndWait({ from: account, to: demo.contract_address, data, gas: '0x2dc6c0' }, 'escape');
-    const pendingEscape = decodePendingWithdrawals(
-        await ethCall(demo.contract_address, encodePendingWithdrawals(wallet.state.note_id)));
-    save({ ...wallet, exit: { mode: 'escape', done: false, tx: hash, destination: to,
+    const pendingEscape = decodePendingWithdrawals(await ethCall(demo.contract_address, encodePendingWithdrawals(noteId)));
+    updateNote(noteId, { exit: { mode: 'escape', done: false, tx: hash, destination: to,
         paid: String(pendingEscape.finalBalance), deadline: Number(pendingEscape.challengeDeadline) } });
-    log(`escape started; finalizable after ${demo.challenge_period} s`, 'ok');
+    $('exit-result').textContent = `Note #${noteId} is escaping: finalize it in My notes after ${demo.challenge_period} s.`;
+    log(`note #${noteId}: escape started; finalizable after ${demo.challenge_period} s`, 'ok');
     await refreshOperator();
 }
 
-async function finalizeEscape() {
-    const wallet = load();
-    await sendAndWait({ from: account, to: demo.contract_address, data: encodeFinalizeEscape(wallet.state.note_id),
-        gas: '0x7a120' }, 'finalize escape');
-    save({ ...wallet, exit: { ...wallet.exit, done: true } });
-    log(`escape finalized: ${eth(wallet.exit.paid)} paid to ${wallet.exit.destination}`, 'ok');
+async function finalizeEscape(noteId) {
+    const note = load().notes[noteId];
+    await sendAndWait({ from: account, to: demo.contract_address, data: encodeFinalizeEscape(noteId), gas: '0x7a120' },
+        'finalize escape');
+    updateNote(noteId, { exit: { ...note.exit, done: true } });
+    $('exit-result').textContent = `Note #${noteId} closed by escape: you received ${eth(note.exit.paid)}.`;
+    log(`note #${noteId}: escape finalized, ${eth(note.exit.paid)} paid to ${note.exit.destination}`, 'ok');
     await refreshOperator();
 }
 
@@ -431,6 +532,7 @@ async function refreshOperator() {
     const logs = await rpc('eth_getLogs', [{ address: demo.contract_address, fromBlock: `0x${demo.deploy_block.toString(16)}`,
         toBlock: 'latest', topics: [NOTE_DEPOSITED_TOPIC] }]);
     claimableNotes = [];
+    const statusBefore = JSON.stringify([...chainStatus]);
     const rows = [];
     for (const entry of logs) {
         const note = {
@@ -440,6 +542,7 @@ async function refreshOperator() {
             expiry: BigInt(`0x${entry.data.slice(66, 130)}`),
         };
         const record = decodeNoteRecord(await ethCall(demo.contract_address, encodeNoteRecord(note.id)));
+        chainStatus.set(note.id, record.status);
         const claimableAt = Number(BigInt(await ethCall(demo.contract_address,
             encodeEffectiveExpiry(note.id, note.commitment, note.amount, note.expiry))));
         const row = document.createElement('tr');
@@ -467,7 +570,9 @@ async function refreshOperator() {
         rows.push(row);
     }
     $('notes').replaceChildren(...rows.reverse());
-    render();
+    // Re-render the wallet only when a note's vault status changed, so the
+    // periodic refresh does not reset a dropdown the user has open.
+    if (JSON.stringify([...chainStatus]) !== statusBefore) render();
 }
 
 async function skipTime(seconds, label) {
@@ -487,6 +592,8 @@ function guarded(button, action) {
         } catch (error) {
             log(error.message, 'err');
         } finally {
+            // render() re-disables the buttons whose state it manages.
+            button.disabled = false;
             render();
         }
     };
@@ -511,10 +618,9 @@ async function main() {
         const query = $('query').value.trim();
         if (query) await search(query);
     });
-    $('retry').onclick = guarded($('retry'), send);
+    $('retry').onclick = guarded($('retry'), () => send());
     $('mutual').onclick = guarded($('mutual'), mutualClose);
     $('escape').onclick = guarded($('escape'), escape);
-    $('finalize').onclick = guarded($('finalize'), finalizeEscape);
     $('refresh-notes').onclick = guarded($('refresh-notes'), refreshOperator);
     $('skip-hour').onclick = guarded($('skip-hour'), () => skipTime(3_600, '+1 h'));
     $('skip-expiry').onclick = guarded($('skip-expiry'), async () => {
@@ -523,15 +629,16 @@ async function main() {
         if (!next) throw new Error('No active note is waiting to expire.');
         await skipTime(next - now + 5, `to ${new Date((next + 5) * 1000).toLocaleString()}`);
     });
+    $('withdraw-note').onchange = render;
     $('reset').onclick = () => {
-        if (confirm('Forget this note? Its secret is only in this browser: the deposit becomes unspendable from here.')) {
+        if (confirm('Forget every note? Their secrets are only in this browser: open notes become unspendable from here.')) {
             localStorage.removeItem(storageKey);
             render();
-            log('note forgotten');
+            log('all notes forgotten');
         }
     };
     render();
-    setInterval(tickEscape, 1_000);
+    setInterval(tick, 1_000);
     setInterval(() => refreshOperator().catch(() => {}), 5_000);
     refreshOperator().catch(error => log(error.message, 'err'));
     log(`prover loaded (setup ${await prover('setupId')}), vault ${demo.contract_address}`);
